@@ -1,0 +1,27 @@
+{
+  "name": "@webops/v4",
+  "version": "4.0.0",
+  "description": "WebOps V4 — One-call session telemetry for React/Next.js/R3F apps",
+  "type": "module",
+  "main": "./agent.ts",
+  "exports": {
+    ".": "./agent.ts",
+    "./script": "./script--Script.ts",
+    "./session": "./session--SessionRunner.ts",
+    "./report": "./report--ReportBuilder.ts",
+    "./react": "./react--useTrack.ts",
+    "./zustand": "./react--zustand-telemetry.ts",
+    "./llm": "./llm--prompt.ts"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "zustand": ">=4"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/react": "^18.2.0"
+  }
+}
