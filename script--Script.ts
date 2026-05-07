@@ -1,20 +1,25 @@
 // script/Script.ts
 // Script DSL — 一体化的"动作 + 观测 + 断言"编排。
 //
-// 核心理念：
-//   V3 的 ATP 协议是纯动作 JSON（offset_ms + action）。
-//   V4 的 Script 让每个 step 既能"做动作"，又能"看结果"，并能在结果不符合预期时立即中止。
+// V4.1 新增：
+//   - 每个动作步骤可带 `intent` 字段：自然语言一句话，说明这一步在做什么、期望什么反应。
+//     analyzer 不消费 intent，它只给 LLM 看，让 timeline 上每条动作旁带语义注解。
+//   - dispatch(reader, cases) macro：消除"读一个值 → branch×N"的高频臃肿模式。
+//     在 builder 层 desugar 为 `read + branch+branch+...`，IR 层不变。
 //
 // 用法（链式）：
 //   Script('classify_acute_card')
 //     .strategy('human_like')
 //     .wait(2000)
 //     .observe('first_card_visible', () => document.querySelector('[data-vt-id="card_focus"]') !== null)
-//     .read('current_angle_type', () => useGameStore.getState().cards[0]?.type)
-//     .branch(
-//       (read) => read('current_angle_type') === 'acute',
-//       (s) => s.click('[data-vt-id="btn_acute"]', { mark: 'CLICK_CORRECT' }),
-//       (s) => s.click('[data-vt-id="btn_obtuse"]', { mark: 'CLICK_WRONG' })
+//     .dispatch(
+//       () => useGameStore.getState().focusedAngleCode,
+//       {
+//         1: (b) => b.key('a', { mark: 'CLICK_ACUTE', intent: '焦点是锐角，按 a 应当 +100 分' }),
+//         2: (b) => b.key('s', { mark: 'CLICK_RIGHT', intent: '焦点是直角，按 s 应当 +100 分' }),
+//         3: (b) => b.key('d', { mark: 'CLICK_OBTUSE', intent: '焦点是钝角，按 d 应当 +100 分' }),
+//       },
+//       { name: 'angle_type' }
 //     )
 //     .wait(800)
 //     .expect('score_increased', () => useGameStore.getState().score > 0)
@@ -24,18 +29,18 @@ export type Strategy = 'human_like' | 'instant';
 
 /** 步骤的中间表示 (IR)，便于后续不同 Runner 实现。 */
 export type StepIR =
-  | { kind: 'wait'; ms: number; label?: string }
-  | { kind: 'click'; target: TargetSpec; mark?: string; mode?: 'pointer' | 'native' }
-  | { kind: 'drag';  from: TargetSpec; to: TargetSpec; durationMs?: number; mark?: string }
-  | { kind: 'type';  text: string; clearFirst?: boolean; mark?: string }
-  | { kind: 'key';   key: string; mark?: string }
-  | { kind: 'mark';  name: string; meta?: Record<string, any> }
-  | { kind: 'observe'; name: string; fn: () => boolean; required?: boolean }
-  | { kind: 'read';    name: string; fn: () => any }
-  | { kind: 'expect';  name: string; fn: () => boolean }
-  | { kind: 'branch'; predicate: (read: ReadFn) => boolean; thenSteps: StepIR[]; elseSteps: StepIR[] }
-  | { kind: 'loop';   times: number; steps: StepIR[] }
-  | { kind: 'wait_for'; name: string; fn: () => boolean; timeoutMs: number };
+  | { kind: 'wait'; ms: number; label?: string; intent?: string }
+  | { kind: 'click'; target: TargetSpec; mark?: string; mode?: 'pointer' | 'native'; intent?: string }
+  | { kind: 'drag';  from: TargetSpec; to: TargetSpec; durationMs?: number; mark?: string; intent?: string }
+  | { kind: 'type';  text: string; clearFirst?: boolean; mark?: string; intent?: string }
+  | { kind: 'key';   key: string; mark?: string; intent?: string }
+  | { kind: 'mark';  name: string; meta?: Record<string, any>; intent?: string }
+  | { kind: 'observe'; name: string; fn: () => boolean; required?: boolean; intent?: string }
+  | { kind: 'read';    name: string; fn: () => any; intent?: string }
+  | { kind: 'expect';  name: string; fn: () => boolean; intent?: string }
+  | { kind: 'branch'; predicate: (read: ReadFn) => boolean; thenSteps: StepIR[]; elseSteps: StepIR[]; intent?: string }
+  | { kind: 'loop';   times: number; steps: StepIR[]; intent?: string }
+  | { kind: 'wait_for'; name: string; fn: () => boolean; timeoutMs: number; intent?: string };
 
 export type TargetSpec =
   | string                                        // CSS 选择器或 vt-id
@@ -80,31 +85,31 @@ class ScriptBuilder {
   }
 
   /** 单击。target 可以是 vt-id、选择器或绝对坐标。 */
-  click(target: TargetSpec, opts: { mark?: string; mode?: 'pointer' | 'native' } = {}): this {
-    this.steps.push({ kind: 'click', target, mark: opts.mark, mode: opts.mode });
+  click(target: TargetSpec, opts: { mark?: string; mode?: 'pointer' | 'native'; intent?: string } = {}): this {
+    this.steps.push({ kind: 'click', target, mark: opts.mark, mode: opts.mode, intent: opts.intent });
     return this;
   }
 
   /** 拖拽（用于 R3F/Rapier 物理交互）。 */
-  drag(from: TargetSpec, to: TargetSpec, opts: { durationMs?: number; mark?: string } = {}): this {
-    this.steps.push({ kind: 'drag', from, to, durationMs: opts.durationMs, mark: opts.mark });
+  drag(from: TargetSpec, to: TargetSpec, opts: { durationMs?: number; mark?: string; intent?: string } = {}): this {
+    this.steps.push({ kind: 'drag', from, to, durationMs: opts.durationMs, mark: opts.mark, intent: opts.intent });
     return this;
   }
 
-  type(text: string, opts: { clearFirst?: boolean; mark?: string } = {}): this {
-    this.steps.push({ kind: 'type', text, clearFirst: opts.clearFirst, mark: opts.mark });
+  type(text: string, opts: { clearFirst?: boolean; mark?: string; intent?: string } = {}): this {
+    this.steps.push({ kind: 'type', text, clearFirst: opts.clearFirst, mark: opts.mark, intent: opts.intent });
     return this;
   }
 
   /** 模拟按键 — 适合本游戏的 'a'/'s'/'d' 三键玩法。 */
-  key(key: string, opts: { mark?: string } = {}): this {
-    this.steps.push({ kind: 'key', key, mark: opts.mark });
+  key(key: string, opts: { mark?: string; intent?: string } = {}): this {
+    this.steps.push({ kind: 'key', key, mark: opts.mark, intent: opts.intent });
     return this;
   }
 
   /** 仅打因果标记，不做动作。 */
-  mark(name: string, meta?: Record<string, any>): this {
-    this.steps.push({ kind: 'mark', name, meta });
+  mark(name: string, meta?: Record<string, any>, intent?: string): this {
+    this.steps.push({ kind: 'mark', name, meta, intent });
     return this;
   }
 
@@ -114,7 +119,7 @@ class ScriptBuilder {
     return this;
   }
 
-  /** 读取一个值（任意类型）—— 后续 branch / read 可以用。 */
+  /** 读取一个值（任意类型）—— 后续 branch / dispatch / read 可以用。 */
   read(name: string, fn: () => any): this {
     this.steps.push({ kind: 'read', name, fn });
     return this;
@@ -142,6 +147,40 @@ class ScriptBuilder {
       thenSteps: thenBuilder.steps,
       elseSteps: elseBuilder.steps
     });
+    return this;
+  }
+
+  /**
+   * dispatch — 读一个值，按值走对应分支。
+   *
+   * 等价于 `.read(name, reader).branch(...).branch(...).branch(...)`，但 1 行写完。
+   *
+   * 注意：cases 的 key 是字符串（JS 对象 key 永远是字符串），但 reader 返回 number 也 OK——
+   * 内部用 String() 强制转换两端做相等比较，这覆盖了 number/string/boolean 的常见值。
+   *
+   * @param reader  返回当前要分发的值的函数
+   * @param cases   值 → 子构建器 的映射；不在 cases 里的值会"什么都不做"继续往下
+   * @param opts.name  生成的 read 步骤名（默认 `_dispatch_<index>`），便于之后用 read('name') 回读
+   */
+  dispatch<V extends string | number | boolean>(
+    reader: () => V,
+    cases: Partial<Record<string, (s: ScriptBuilder) => ScriptBuilder>>,
+    opts: { name?: string } = {}
+  ): this {
+    const name = opts.name ?? `_dispatch_${this.steps.length}`;
+    this.steps.push({ kind: 'read', name, fn: reader });
+    for (const key of Object.keys(cases)) {
+      const branchFn = cases[key];
+      if (!branchFn) continue;
+      const inner = new ScriptBuilder(this.scenarioId);
+      branchFn(inner);
+      this.steps.push({
+        kind: 'branch',
+        predicate: (read) => String(read(name)) === key,
+        thenSteps: inner.steps,
+        elseSteps: []
+      });
+    }
     return this;
   }
 

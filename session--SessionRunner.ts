@@ -1,15 +1,9 @@
 // session/SessionRunner.ts
 // 一体化 Session 执行器 — V4 的单点入口。
 //
-// 这是 V4 相对 V3 的核心重构：
-//   V3：start() → execute(timeline) → 等 1.5 秒 → stop() → analyzer.analyze()  (四个分离调用)
-//   V4：runSession(script) 一次返回完整 Report                                   (单原子调用)
-//
-// 关键设计：
-//   1. 统一时钟：DOM 采样、音频采样、R3F 采样、K线 flush 全在同一个 RAF 循环里。
-//   2. 帧合流：100ms 一帧 TelemetryFrame，DOM/Virtual/Audio/R3F 数据原子合并。
-//   3. 动作就绪即采：每个 step 执行前后都标记 timestamp，K线和动作时间线天然对齐。
-//   4. 失败可恢复：observe 失败/expect 失败都不终止 session（除非显式声明），保证全程数据。
+// V4.1 新增：
+//   - ActionRecord 携带 `intent`：从 StepIR 透传，给 LLM 看的语义注解。
+//   - maxFrames 上限：避免长跑 session 把 frames 数组堆爆，超过时丢中段保两端。
 
 import { CompiledScript, StepIR, ReadFn } from './script--Script';
 import { ActionDispatcher } from './script--actions';
@@ -34,6 +28,8 @@ export interface ActionRecord {
   startTs: number;
   endTs: number;
   ok: boolean;
+  /** 自然语言解释这一步在做什么 / 期望什么反应（来自 StepIR.intent）。 */
+  intent?: string;
   // 对 observe / expect / read 步骤而言，记录其结果
   result?: any;
   // 对 click / drag 等而言，记录目标坐标
@@ -58,12 +54,16 @@ export interface SessionReport {
   errors: string[];
   /** 是否因为 expect 失败而中止。 */
   abortedAt?: number;
+  /** 是否因为 frame buffer 上限触发了截断（信息字段，便于 LLM 判断信号是否完整）。 */
+  framesTruncated?: boolean;
 }
 
 export interface RunnerOptions {
   flushIntervalMs?: number;
   enableAudio?: boolean;
   enableR3F?: boolean;
+  /** Frame 缓冲上限。超过时丢中段、保两端，避免长跑 session 让 LLMPayload 爆炸。 */
+  maxFrames?: number;
 }
 
 export class SessionRunner {
@@ -77,11 +77,13 @@ export class SessionRunner {
   private flushIntervalMs: number;
   private enableAudio: boolean;
   private enableR3F: boolean;
+  private maxFrames: number;
 
   constructor(opts: RunnerOptions = {}) {
     this.flushIntervalMs = opts.flushIntervalMs ?? 100;
     this.enableAudio = opts.enableAudio ?? true;
     this.enableR3F = opts.enableR3F ?? true;
+    this.maxFrames = opts.maxFrames ?? 800;
     this.vc = new VirtualChannel();
     this.dom = new DOMTelemetry(this.vc);
     this.audio = new AudioTelemetry(this.vc);
@@ -111,6 +113,7 @@ export class SessionRunner {
     this.reads = {};
     this.markersMeta = [];
     this.errors = [];
+    this.framesTruncated = false;
 
     // 1. 启动所有探针
     this.dom.start();
@@ -159,7 +162,8 @@ export class SessionRunner {
       reads: { ...this.reads },
       observations: this.observations,
       errors: this.errors,
-      abortedAt
+      abortedAt,
+      framesTruncated: this.framesTruncated
     };
   }
 
@@ -172,6 +176,7 @@ export class SessionRunner {
   private markersMeta: SessionReport['markers'] = [];
   private errors: string[] = [];
   private lastFlushTs = 0;
+  private framesTruncated = false;
 
   private async executeSteps(
     steps: StepIR[],
@@ -184,13 +189,16 @@ export class SessionRunner {
       if (isAborted() || isTimedOut()) return;
       const step = steps[i];
       const startTs = performance.now();
+      // intent 字段在所有 StepIR variant 上都是可选,这里统一透传
+      const stepIntent = (step as { intent?: string }).intent;
       let record: ActionRecord = {
         index: i,
         kind: step.kind,
         name: this.stepName(step),
         startTs,
         endTs: startTs,
-        ok: true
+        ok: true,
+        intent: stepIntent
       };
       try {
         await this.executeOne(step, script, record);
@@ -288,8 +296,9 @@ export class SessionRunner {
         return;
       }
       case 'branch': {
-        const branch = step.predicate(readFn) ? step.thenSteps : step.elseSteps;
-        rec.meta = { taken: step.predicate(readFn) ? 'then' : 'else', size: branch.length };
+        const taken = step.predicate(readFn);
+        const branch = taken ? step.thenSteps : step.elseSteps;
+        rec.meta = { taken: taken ? 'then' : 'else', size: branch.length };
         await this.executeSteps(
           branch, script,
           () => false, () => false, () => {}
@@ -370,6 +379,19 @@ export class SessionRunner {
       domNodes: domSnap.nodes,
       virtual: vData
     });
+
+    // 防爆：超过 maxFrames 后做"丢中段保两端"，确保 LLMPayload 不会无界增长。
+    // 保留前半 60% + 后半 40% 是经验比例 —— 起始通常含 setup 信号，结尾含 victory/gameover 信号，
+    // 中段是稳态循环，丢一些不影响 LLM 推断。
+    if (this.frames.length > this.maxFrames) {
+      const head = Math.floor(this.maxFrames * 0.6);
+      const tail = this.maxFrames - head;
+      this.frames = [
+        ...this.frames.slice(0, head),
+        ...this.frames.slice(this.frames.length - tail)
+      ];
+      this.framesTruncated = true;
+    }
   }
 }
 

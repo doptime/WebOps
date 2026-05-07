@@ -6,6 +6,10 @@
 //   facts:  动作时间线、观测断言、关键 K 线窗口
 //   verdict: 自动诊断结果（区间 verdict、音画同步、计分）
 //
+// V4.1 新增：
+//   - timeline 事件携带 `intent` 字段（来自 ActionRecord.intent）—— LLM 一眼看到"做这一步是为啥"。
+//   - meta 多 framesTruncated 字段，告诉 LLM frames 是否被中段丢弃。
+//
 // 大模型只需看 facts + verdict 就能给出"游戏设计是否实现正确"的高级判断。
 
 import { SessionReport } from './session--SessionRunner';
@@ -21,9 +25,14 @@ export interface LLMPayload {
     frameCount: number;
     hadErrors: boolean;
     aborted: boolean;
+    framesTruncated?: boolean;
   };
   /** 测试假设 — 由调用方提供，告诉 LLM "你期望看到什么"。 */
   hypothesis?: string;
+  /** 该 scenario 在审计什么设计意图（与 hypothesis 互补:hypothesis 偏断言,intent 偏目的）。 */
+  intent?: string;
+  /** 标签,便于 LLM 分类聚合（happy-path / failure-path / stress / ...）。 */
+  tags?: string[];
   facts: {
     /** 动作时间线（精简版） */
     timeline: TimelineEvent[];
@@ -50,6 +59,8 @@ interface TimelineEvent {
   type: string;       // step kind / marker / observe / expect
   name: string;
   ok?: boolean;
+  /** 自然语言注解,从 StepIR.intent 透传过来。 */
+  intent?: string;
   detail?: string;
 }
 
@@ -93,6 +104,8 @@ export function buildLLMPayload(
   report: SessionReport,
   opts: {
     hypothesis?: string;
+    intent?: string;
+    tags?: string[];
     compressOpts?: CompressOptions;
     includeRaw?: boolean;
   } = {}
@@ -108,6 +121,7 @@ export function buildLLMPayload(
       type: a.kind,
       name: a.name,
       ok: a.ok,
+      intent: a.intent,
       detail: a.error ?? (a.result !== undefined ? JSON.stringify(a.result).slice(0, 120) : undefined)
     });
   }
@@ -140,9 +154,12 @@ export function buildLLMPayload(
       url: report.url,
       frameCount: report.frames.length,
       hadErrors: report.errors.length > 0,
-      aborted: report.abortedAt !== undefined
+      aborted: report.abortedAt !== undefined,
+      framesTruncated: report.framesTruncated
     },
     hypothesis: opts.hypothesis,
+    intent: opts.intent,
+    tags: opts.tags,
     facts: {
       timeline,
       state: report.reads,
@@ -176,6 +193,7 @@ export function buildLLMPayload(
 export function summarize(payload: LLMPayload): string {
   const lines: string[] = [];
   lines.push(`# Session [${payload.meta.scenarioId}] — ${payload.meta.durationMs}ms / ${payload.meta.frameCount} frames`);
+  if (payload.intent) lines.push(`Intent: ${payload.intent}`);
   if (payload.hypothesis) lines.push(`Hypothesis: ${payload.hypothesis}`);
   lines.push(`Score: ${payload.verdict.overallScore}/100 (interval=${payload.verdict.intervalScore} expect=${payload.verdict.expectScore} audio=${payload.verdict.audioScore})`);
   if (payload.verdict.alerts.length) {
@@ -185,7 +203,8 @@ export function summarize(payload: LLMPayload): string {
   lines.push('Timeline:');
   payload.facts.timeline.forEach((e) => {
     const flag = e.ok === false ? '✗' : (e.ok === true ? '✓' : ' ');
-    lines.push(`  ${String(e.t).padStart(5)}ms ${flag} ${e.type.padEnd(8)} ${e.name}${e.detail ? ` -- ${e.detail}` : ''}`);
+    const intentSuffix = e.intent ? ` // ${e.intent}` : '';
+    lines.push(`  ${String(e.t).padStart(5)}ms ${flag} ${e.type.padEnd(8)} ${e.name}${e.detail ? ` -- ${e.detail}` : ''}${intentSuffix}`);
   });
   lines.push('Top signals (by activity):');
   payload.facts.tracks.slice(0, 8).forEach((t) => {
