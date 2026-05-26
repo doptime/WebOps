@@ -1,9 +1,9 @@
 // session/SessionRunner.ts
 // 一体化 Session 执行器 — V4 的单点入口。
 //
-// V4.1 新增：
-//   - ActionRecord 携带 `intent`：从 StepIR 透传，给 LLM 看的语义注解。
-//   - maxFrames 上限：避免长跑 session 把 frames 数组堆爆，超过时丢中段保两端。
+// V4.1 新增:
+//   - ActionRecord 携带 `intent`:从 StepIR 透传,给 LLM 看的语义注解。
+//   - maxFrames 上限:避免长跑 session 把 frames 数组堆爆,超过时丢中段保两端。
 
 import { CompiledScript, StepIR, ReadFn } from './script--Script';
 import { ActionDispatcher } from './script--actions';
@@ -28,11 +28,11 @@ export interface ActionRecord {
   startTs: number;
   endTs: number;
   ok: boolean;
-  /** 自然语言解释这一步在做什么 / 期望什么反应（来自 StepIR.intent）。 */
+  /** 自然语言解释这一步在做什么 / 期望什么反应(来自 StepIR.intent)。 */
   intent?: string;
-  // 对 observe / expect / read 步骤而言，记录其结果
+  // 对 observe / expect / read 步骤而言,记录其结果
   result?: any;
-  // 对 click / drag 等而言，记录目标坐标
+  // 对 click / drag 等而言,记录目标坐标
   meta?: Record<string, any>;
   error?: string;
 }
@@ -45,16 +45,16 @@ export interface SessionReport {
   url: string;
   frames: TelemetryFrame[];
   actions: ActionRecord[];
-  /** 显式打的 markers（不含 __SCENARIO_*__）。 */
+  /** 显式打的 markers(不含 __SCENARIO_*__)。 */
   markers: { name: string; ts: number; meta?: Record<string, any> }[];
-  /** read() 收集的最终值（便于 LLM 看上下文）。 */
+  /** read() 收集的最终值(便于 LLM 看上下文)。 */
   reads: Record<string, any>;
   /** observe() 与 expect() 的总览。 */
   observations: { name: string; ts: number; passed: boolean; required: boolean }[];
   errors: string[];
   /** 是否因为 expect 失败而中止。 */
   abortedAt?: number;
-  /** 是否因为 frame buffer 上限触发了截断（信息字段，便于 LLM 判断信号是否完整）。 */
+  /** 是否因为 frame buffer 上限触发了截断(信息字段,便于 LLM 判断信号是否完整)。 */
   framesTruncated?: boolean;
 }
 
@@ -62,7 +62,7 @@ export interface RunnerOptions {
   flushIntervalMs?: number;
   enableAudio?: boolean;
   enableR3F?: boolean;
-  /** Frame 缓冲上限。超过时丢中段、保两端，避免长跑 session 让 LLMPayload 爆炸。 */
+  /** Frame 缓冲上限。超过时丢中段、保两端,避免长跑 session 让 LLMPayload 爆炸。 */
   maxFrames?: number;
 }
 
@@ -91,7 +91,7 @@ export class SessionRunner {
     this.actions = new ActionDispatcher(this.vc);
   }
 
-  /** 从 SessionRunner 外部直接打 marker（适合在业务回调里用）。 */
+  /** 从 SessionRunner 外部直接打 marker(适合在业务回调里用)。 */
   mark(name: string, meta?: Record<string, any>): void {
     this.vc.pushMetric('__markers__', name, performance.now());
     if (meta) {
@@ -142,7 +142,7 @@ export class SessionRunner {
     this.vc.pushMetric('__markers__', '__SCENARIO_END__', endTs);
     this.markersMeta.push({ name: '__SCENARIO_END__', ts: endTs });
 
-    // 4. 最后再 flush 一次，捕获扫尾的动画和音效。
+    // 4. 最后再 flush 一次,捕获扫尾的动画和音效。
     this.tickOnce(true);
 
     // 5. 关停
@@ -380,9 +380,9 @@ export class SessionRunner {
       virtual: vData
     });
 
-    // 防爆：超过 maxFrames 后做"丢中段保两端"，确保 LLMPayload 不会无界增长。
-    // 保留前半 60% + 后半 40% 是经验比例 —— 起始通常含 setup 信号，结尾含 victory/gameover 信号，
-    // 中段是稳态循环，丢一些不影响 LLM 推断。
+    // 防爆:超过 maxFrames 后做"丢中段保两端",确保 LLMPayload 不会无界增长。
+    // 保留前半 60% + 后半 40% 是经验比例 —— 起始通常含 setup 信号,结尾含 victory/gameover 信号,
+    // 中段是稳态循环,丢一些不影响 LLM 推断。
     if (this.frames.length > this.maxFrames) {
       const head = Math.floor(this.maxFrames * 0.6);
       const tail = this.maxFrames - head;

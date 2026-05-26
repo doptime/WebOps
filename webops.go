@@ -1,372 +1,329 @@
-// webops.go — V4 Go 后端,单文件全闭环。
+// Package webops 提供 V5 的"Go-authored inline scripts"能力。
 //
-// V4.1 改动:
-//   - 共享长寿命 ExecAllocator:不再每次请求 spawn 新 Chrome 进程。
-//     Per-request 用 chromedp.NewContext(sharedAlloc) 开新 tab,Chrome 进程复用,内存占用降一个量级。
-//   - 信号量 sem 卡死并发上限,超过排队等(防 OOM)。
-//   - 新增 POST /webops/diagnose-batch:fan-out N 个 scenario 并发跑,
-//     聚合所有 LLMPayload 后做一次 LLM 调用,产出跨场景判决。
-//   - 新增 GET /webops/describe:用 WebOps.describe() 替代旧的 /webops/scenarios,
-//     拿到 gameIntent + scenarios[] 全量元数据。
+// V5 设计:
+//   - 测试脚本用 Go 端 builder (webops.Script(id).Wait().Loop().Build()) 拼成 InlineScript IR。
+//   - chromedp 每次 navigate 后,evaluate `window.WebOps.runInline(IR, meta)` 把脚本送进 tab。
+//   - 一次 Audit() 调用 = 把多个 scenario 并行跑(每个独立 tab)+ 跨场景汇总送 LLM。
 //
-// 设计原则不变:不定义任何业务数据类型。所有载荷当 string/RawMessage 透传。
-//
-// 用法:
-//   go mod init yourorg/webops
-//   go get github.com/chromedp/chromedp golang.org/x/sync/errgroup
-//   ANTHROPIC_API_KEY=sk-ant-... go run webops.go
-
-package main
+// 与 V4.1 webops.go (独立 HTTP server) 的差异:
+//   - 没有 HTTP 端点。调用方直接 import 这个包,wires Audit() 进自己的 CLI / harness。
+//   - 没有 TS 端 register/describe — 脚本直接随每次 navigate 内联送达。
+package webops
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
-	"golang.org/x/sync/errgroup"
 )
 
-// ---------- 配置 ----------
+// ---------- 常量与可调参数 ----------
 
-var (
-	maxConcurrency = 8 // 同时打开的 tab 上限,可由 -concurrency 覆盖
-	llmModel       = "claude-opus-4-7"
-	listenAddr     = ":8080"
-)
-
-// auditParam 是 Go chromedp tab 与业务侧 Bootstrap 之间的"审计开关"。
-//
-// 每次 chromedp.Navigate 把它拼到 URL 后,Bootstrap 用 shouldEnableWebOps() 检测到才注册剧本。
-// 普通用户访问的 URL 不带它,所以审计 chunk 不下载、window.WebOps 不存在。
-//
-// 故意写死成常量而不是 flag:
-//   - Go 二进制就是审计工具本身,不存在"关掉审计"的运行模式,flag 是配置噪音。
-//   - 真要改名(比如换成更隐蔽的串挡偶然访客),请同时修改 webops.go 和 runtime.ts
-//     里的常量 —— 两边一起改才能保持约定一致,这种"成对改动"用源码 grep 比 flag 安全。
+// 与 runtime.ts shouldEnableWebOps() 默认值必须保持一致。要换名挡偶然访客,两边一起改。
 const auditParam = "webops=1"
 
-// applyAuditParam — 把 auditParam 安全地拼到 URL 上,处理已有 query / fragment 的情况。
-func applyAuditParam(rawURL string) string {
-	parts := strings.SplitN(auditParam, "=", 2)
-	key := parts[0]
-	val := "1"
-	if len(parts) == 2 {
-		val = parts[1]
-	}
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		// URL 解析失败兜底:粗暴拼接,起码不会让请求崩。
-		sep := "?"
-		if strings.Contains(rawURL, "?") {
-			sep = "&"
-		}
-		return rawURL + sep + auditParam
-	}
-	q := u.Query()
-	q.Set(key, val)
-	u.RawQuery = q.Encode()
-	return u.String()
-}
-
-// ---------- 共享 Browser ----------
-//
-// 整个进程一个长寿命 Chrome,所有 tab 在它里面开。
-// chromedp.NewContext(sharedAllocCtx) 创建一个新 tab(BrowserContext),互相隔离。
-// 第一次 Run 之后 Chrome 才真正起来; 后续 tab 复用进程,无冷启动。
-
+// 包级可调常量。需要时在程序启动早期改。
 var (
-	sharedAllocCtx context.Context
-	sharedCancel   context.CancelFunc
-	sharedOnce     sync.Once
-	sem            chan struct{}
+	DefaultConcurrency = 8
+	DefaultLLMModel    = "claude-opus-4-7"
+	NavTimeout         = 25 * time.Second
+	RunTimeout         = 180 * time.Second
 )
 
-func ensureBrowser() {
-	sharedOnce.Do(func() {
-		opts := append(chromedp.DefaultExecAllocatorOptions[:],
-			chromedp.Flag("headless", true),
-			chromedp.Flag("disable-gpu", true),
-			chromedp.Flag("no-sandbox", true),
-			chromedp.Flag("disable-dev-shm-usage", true),
-		)
-		sharedAllocCtx, sharedCancel = chromedp.NewExecAllocator(context.Background(), opts...)
-		sem = make(chan struct{}, maxConcurrency)
-		log.Printf("[webops] shared browser pool ready, concurrency=%d", maxConcurrency)
-	})
+// ---------- IR 类型 ----------
+
+// Predicate / ValueSource / Target / Step 都是 map[string]any 的定义类型,
+// 直接 marshal 成 JSON 即与 TS 端 script--ir.ts 的 Predicate / ValueSource / IRStep 对齐。
+type Predicate map[string]any
+type ValueSource map[string]any
+type Target map[string]any
+type Step map[string]any
+
+// Cases 是 Dispatch 的 case 表(value → branch 构造器)。
+type Cases map[string]func(*B)
+
+// InlineScript 由 builder Build() 产出,送入 chromedp evaluate 时直接 marshal 成 JSON。
+type InlineScript struct {
+	ScenarioID           string `json:"scenarioId"`
+	Strategy             string `json:"strategy"`
+	ContinueOnExpectFail bool   `json:"continueOnExpectFail"`
+	SessionTimeoutMs     int    `json:"sessionTimeoutMs"`
+	Steps                []Step `json:"steps"`
+	Store                string `json:"store,omitempty"`
 }
 
-// ---------- LLM ----------
+// ---------- Target 构造器 ----------
 
-// 与前端 ReportBuilder 输出的 LLMPayload 格式约定保持一致(但 Go 不解析其中字段)。
-const singleScenarioSystemPrompt = `You are an expert game design auditor. You receive structured telemetry from automated playthroughs of a web game (React + Next.js + R3F). Your job:
+// Vt 用 vt-id 定位元素(底层 selector = [data-vt-id="..."])。
+func Vt(id string) Target  { return Target{"vtId": id} }
+func Sel(s string) Target  { return Target{"selector": s} }
+func XY(x, y int) Target   { return Target{"x": x, "y": y} }
 
-1. Read the developer's HYPOTHESIS — what should happen if the game is implemented correctly.
-2. Read the FACTS — actions taken, observations, state reads, and signal tracks.
-3. Read the AUTO_VERDICT — pre-computed scores and per-interval HEALTHY/NO_RESPONSE/CHAOTIC labels.
-4. Output a clear judgment: did the game fulfill its design intent? If not, what specific issue occurred and where (cite step indices, marker names, or signal names).
+// ---------- Predicate 构造器 ----------
 
-Output STRICT JSON with this schema:
-{
-  "verdict": "PASS" | "PARTIAL" | "FAIL",
-  "score": 0..100,
-  "hypothesis_satisfied": [string],
-  "hypothesis_violated": [string],
-  "root_causes": [
-    { "issue": string, "evidence": string, "suggested_fix": string }
-  ],
-  "notes": string
+func StateEq(path string, v any) Predicate { return Predicate{"op": "state_eq", "path": path, "value": v} }
+func StateNe(path string, v any) Predicate { return Predicate{"op": "state_ne", "path": path, "value": v} }
+func StateGt(path string, v float64) Predicate { return Predicate{"op": "state_gt", "path": path, "value": v} }
+func StateGe(path string, v float64) Predicate { return Predicate{"op": "state_ge", "path": path, "value": v} }
+func StateLt(path string, v float64) Predicate { return Predicate{"op": "state_lt", "path": path, "value": v} }
+func StateLe(path string, v float64) Predicate { return Predicate{"op": "state_le", "path": path, "value": v} }
+func StateIn(path string, vs ...any) Predicate { return Predicate{"op": "state_in", "path": path, "values": vs} }
+func StateTruthy(path string) Predicate    { return Predicate{"op": "state_truthy", "path": path} }
+func StateLenEq(path string, n int) Predicate { return Predicate{"op": "state_len_eq", "path": path, "value": n} }
+func StateLenGt(path string, n int) Predicate { return Predicate{"op": "state_len_gt", "path": path, "value": n} }
+func StateCountEq(path, key string, eq any, count int) Predicate {
+	return Predicate{"op": "state_count_eq", "path": path, "key": key, "eq": eq, "count": count}
+}
+func StateEveryEq(path, key string, eq any) Predicate {
+	return Predicate{"op": "state_every_eq", "path": path, "key": key, "eq": eq}
+}
+func DOMExists(sel string) Predicate  { return Predicate{"op": "dom_exists", "selector": sel} }
+func DOMMissing(sel string) Predicate { return Predicate{"op": "dom_missing", "selector": sel} }
+
+func All(preds ...Predicate) Predicate { return Predicate{"op": "all", "preds": preds} }
+func Any(preds ...Predicate) Predicate { return Predicate{"op": "any", "preds": preds} }
+func Not(p Predicate) Predicate        { return Predicate{"op": "not", "pred": p} }
+
+func ReadEq(name string, v any) Predicate { return Predicate{"op": "read_eq", "name": name, "value": v} }
+func ReadModEq(name string, mod, v int) Predicate {
+	return Predicate{"op": "read_mod_eq", "name": name, "mod": mod, "value": v}
+}
+func ExprP(code string) Predicate { return Predicate{"op": "expr", "code": code} }
+
+// ---------- ValueSource 构造器 ----------
+
+func StateGet(path string) ValueSource     { return ValueSource{"op": "state_get", "path": path} }
+func StateLen(path string) ValueSource     { return ValueSource{"op": "state_len", "path": path} }
+func StateCount(path, key string, eq any) ValueSource {
+	return ValueSource{"op": "state_count", "path": path, "key": key, "eq": eq}
+}
+func StateMap(path, key string) ValueSource {
+	return ValueSource{"op": "state_map", "path": path, "key": key}
+}
+func ExprV(code string) ValueSource { return ValueSource{"op": "expr", "code": code} }
+
+// ---------- 步骤 Options ----------
+
+// Opt 是步骤的函数式 option。
+type Opt func(Step)
+
+func Mark(name string) Opt     { return func(s Step) { s["mark"] = name } }
+func Intent(text string) Opt   { return func(s Step) { s["intent"] = text } }
+func Mode(m string) Opt        { return func(s Step) { s["mode"] = m } }                // "native" / "pointer"
+func Duration(ms int) Opt      { return func(s Step) { s["durationMs"] = ms } }
+func ClearFirst(b bool) Opt    { return func(s Step) { s["clearFirst"] = b } }
+func WithMeta(m map[string]any) Opt { return func(s Step) { s["meta"] = m } }
+
+func applyOpts(s Step, opts []Opt) Step {
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
-Rules:
-- Be concrete: cite step names like "click@5" or marker names like "CLICK_ACUTE_CORRECT".
-- Don't invent signals that aren't in the FACTS.
-- If a signal's overall K-line is ∅ (empty), treat it as "never observed".
-- An interval verdict of NO_RESPONSE is strong evidence of a UI deadlock.
-- FAIL_SILENT in audioSyncs means the action did not produce expected sound feedback.
-- expectScore < 100 means at least one explicit assertion failed.
-- Prefer the action's intent annotation (timeline[].intent) over guessing what an action was for.`
+// ---------- Builder ----------
 
-const batchSystemPrompt = `You are an expert game design auditor. You receive a BATCH of automated playthroughs of the same web game, each playthrough exercising a different aspect of the design (different scenarios with their own hypotheses).
-
-Your job is twofold:
-
-1. PER-SCENARIO judgment: for each scenario, decide PASS / PARTIAL / FAIL with concrete evidence.
-2. CROSS-SCENARIO root-cause analysis: identify patterns that span multiple scenarios. If two scenarios fail with related symptoms, propose a single root cause and a single fix that addresses both. This is the highest-value output.
-
-For every suggested fix, you MUST classify whether the fix lives in the GAME SOURCE CODE, the TEST SCRIPT, or BOTH. The same symptom can mean either: (a) the game logic is wrong, or (b) the script is testing the wrong thing. Be explicit.
-
-Output STRICT JSON with this schema:
-{
-  "perScenario": [
-    {
-      "scenarioId": string,
-      "verdict": "PASS" | "PARTIAL" | "FAIL" | "INFRA_FAIL",
-      "score": 0..100,
-      "evidence": [string]
-    }
-  ],
-  "crossScenarioFindings": [
-    {
-      "pattern": string,
-      "scenariosAffected": [string],
-      "evidence": string
-    }
-  ],
-  "rootCauses": [
-    {
-      "issue": string,
-      "suggestedFix": {
-        "target": "code" | "script" | "both",
-        "file": string,
-        "change": string
-      }
-    }
-  ],
-  "notes": string
+// B 是 Script builder。所有方法返回 *B,链式调用。
+//
+// 用法:
+//   webops.Script("perfect_player").
+//       Strategy("human_like").
+//       Wait(800, "warmup").
+//       Loop(6, func(s *webops.B) {
+//           s.WaitFor("ready", webops.StateEq("phase", "CHOOSING"), 4000)
+//           s.Dispatch("kind", webops.StateGet("currentTarget"), webops.Cases{...})
+//       }).
+//       Expect("victory", webops.StateEq("phase", "COMPLETE")).
+//       Build()
+type B struct {
+	scenarioID         string
+	strategy           string
+	timeoutMs          int
+	continueOnFail     bool
+	store              string
+	steps              []Step
 }
 
-Rules:
-- Cite specific step names, marker names, and timeline timestamps.
-- A scenario marked INFRA_FAIL (set by the harness, not by you) means chromedp/network/setup failed; do not score it.
-- Prefer cross-scenario patterns over per-scenario noise: if 3 scenarios all show "audioScore: 0", that's a single root cause, not three.
-- Use the intent field on timeline events to ground your reasoning in what the test author meant.
-- Keep notes short; put real content in rootCauses.`
-
-func callLLMSingle(ctx context.Context, apiKey, payload, hypothesis string) (string, error) {
-	if hypothesis == "" {
-		hypothesis = "(no hypothesis provided — judge based on intuitive game design correctness)"
+// Script 创建一个新 builder。
+func Script(id string) *B {
+	return &B{
+		scenarioID:     id,
+		strategy:       "human_like",
+		timeoutMs:      120_000,
+		continueOnFail: true,
+		steps:          []Step{},
 	}
-	userPrompt := fmt.Sprintf(
-		"# HYPOTHESIS\n%s\n\n# FACTS\n\n```json\n%s\n```\n\nNow output your JSON judgment.",
-		hypothesis, payload,
-	)
-	return callAnthropic(ctx, apiKey, singleScenarioSystemPrompt, userPrompt)
 }
 
-// callLLMBatch — 把 gameIntent + 多 scenario 的 payload 拼成一次 prompt 送 LLM,产出跨场景判决。
-func callLLMBatch(ctx context.Context, apiKey, gameIntent string, results []scenarioResult) (string, error) {
-	var sb bytes.Buffer
-	sb.WriteString("# GAME DESIGN INTENT\n")
-	if gameIntent == "" {
-		sb.WriteString("(none provided — infer from scenario hypotheses)\n")
-	} else {
-		sb.WriteString(gameIntent)
-		sb.WriteString("\n")
+func (b *B) Strategy(s string) *B               { b.strategy = s; return b }
+func (b *B) Timeout(ms int) *B                  { b.timeoutMs = ms; return b }
+func (b *B) ContinueOnExpectFail(yes bool) *B   { b.continueOnFail = yes; return b }
+func (b *B) Store(name string) *B               { b.store = name; return b }
+
+// 等待
+func (b *B) Wait(ms int, label string) *B {
+	s := Step{"kind": "wait", "ms": ms}
+	if label != "" {
+		s["label"] = label
 	}
-
-	sb.WriteString("\n# SCENARIOS IN THIS BATCH\n")
-	for _, r := range results {
-		fmt.Fprintf(&sb, "- %s\n", r.ScenarioID)
-		if r.Intent != "" {
-			fmt.Fprintf(&sb, "    intent:     %s\n", r.Intent)
-		}
-		fmt.Fprintf(&sb, "    hypothesis: %s\n", r.Hypothesis)
-		if len(r.Tags) > 0 {
-			fmt.Fprintf(&sb, "    tags:       %v\n", r.Tags)
-		}
-		if r.InfraError != "" {
-			fmt.Fprintf(&sb, "    INFRA_FAIL: %s\n", r.InfraError)
-		}
-	}
-
-	sb.WriteString("\n# PAYLOADS (one per scenario)\n")
-	for _, r := range results {
-		fmt.Fprintf(&sb, "\n## scenario: %s\n", r.ScenarioID)
-		if r.InfraError != "" {
-			sb.WriteString("(no payload — infrastructure error, see SCENARIOS section)\n")
-			continue
-		}
-		sb.WriteString("```json\n")
-		sb.Write(r.Payload)
-		sb.WriteString("\n```\n")
-	}
-
-	sb.WriteString("\nNow output your JSON judgment per the schema in the system prompt.\n")
-
-	return callAnthropic(ctx, apiKey, batchSystemPrompt, sb.String())
+	b.steps = append(b.steps, s)
+	return b
 }
 
-func callAnthropic(ctx context.Context, apiKey, system, userPrompt string) (string, error) {
-	body, _ := json.Marshal(map[string]any{
-		"model":      llmModel,
-		"max_tokens": 4000,
-		"system":     system,
-		"messages":   []map[string]string{{"role": "user", "content": userPrompt}},
-	})
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://api.anthropic.com/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("anthropic %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var shell struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(respBody, &shell); err != nil {
-		return string(respBody), nil
-	}
-	var out bytes.Buffer
-	for _, c := range shell.Content {
-		if c.Type == "text" {
-			out.WriteString(c.Text)
-		}
-	}
-	return out.String(), nil
+func (b *B) WaitFor(name string, check Predicate, timeoutMs int, opts ...Opt) *B {
+	s := Step{"kind": "wait_for", "name": name, "check": check, "timeoutMs": timeoutMs}
+	b.steps = append(b.steps, applyOpts(s, opts))
+	return b
 }
 
-// ---------- 浏览器侧调用 ----------
-
-// runOneScenario — 在共享 browser 里开新 tab,navigate,跑指定 scenario,关 tab,返回 payload 原文。
-// 调用方负责 ctx 超时控制。
-func runOneScenario(ctx context.Context, url, scenarioID string) (string, error) {
-	ensureBrowser()
-
-	select {
-	case sem <- struct{}{}:
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
-	defer func() { <-sem }()
-
-	// 每次新 tab,跨请求隔离 storage / cookie / window。
-	bctx, cancelB := chromedp.NewContext(sharedAllocCtx)
-	defer cancelB()
-
-	navCtx, cancelNav := context.WithTimeout(bctx, 25*time.Second)
-	defer cancelNav()
-	if err := chromedp.Run(navCtx,
-		chromedp.Navigate(applyAuditParam(url)),
-		chromedp.Poll(
-			`typeof window.WebOps === 'object' && typeof window.WebOps.run === 'function'`,
-			nil,
-		),
-	); err != nil {
-		return "", fmt.Errorf("navigate / wait WebOps: %w", err)
-	}
-
-	runCtx, cancelRun := context.WithTimeout(bctx, 120*time.Second)
-	defer cancelRun()
-	var payload string
-	expr := fmt.Sprintf(`window.WebOps.run(%q)`, scenarioID)
-	if err := chromedp.Run(runCtx, chromedp.Evaluate(expr, &payload)); err != nil {
-		return "", fmt.Errorf("evaluate run: %w", err)
-	}
-	return payload, nil
+// 动作
+func (b *B) Click(target Target, opts ...Opt) *B {
+	s := Step{"kind": "click", "target": target}
+	b.steps = append(b.steps, applyOpts(s, opts))
+	return b
 }
 
-// describePage — 调 window.WebOps.describe() 拿元数据(gameIntent + scenarios[])。
-func describePage(ctx context.Context, url string) (json.RawMessage, error) {
-	ensureBrowser()
+func (b *B) Drag(from, to Target, opts ...Opt) *B {
+	s := Step{"kind": "drag", "from": from, "to": to}
+	b.steps = append(b.steps, applyOpts(s, opts))
+	return b
+}
 
-	select {
-	case sem <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+func (b *B) Type(text string, opts ...Opt) *B {
+	s := Step{"kind": "type", "text": text}
+	b.steps = append(b.steps, applyOpts(s, opts))
+	return b
+}
+
+func (b *B) Key(key string, opts ...Opt) *B {
+	s := Step{"kind": "key", "key": key}
+	b.steps = append(b.steps, applyOpts(s, opts))
+	return b
+}
+
+func (b *B) MarkOnly(name string, opts ...Opt) *B {
+	s := Step{"kind": "mark", "name": name}
+	b.steps = append(b.steps, applyOpts(s, opts))
+	return b
+}
+
+// 观测 / 读取 / 断言
+func (b *B) Observe(name string, check Predicate, opts ...Opt) *B {
+	s := Step{"kind": "observe", "name": name, "check": check}
+	b.steps = append(b.steps, applyOpts(s, opts))
+	return b
+}
+
+func (b *B) Read(name string, source ValueSource, opts ...Opt) *B {
+	s := Step{"kind": "read", "name": name, "source": source}
+	b.steps = append(b.steps, applyOpts(s, opts))
+	return b
+}
+
+func (b *B) Expect(name string, check Predicate, opts ...Opt) *B {
+	s := Step{"kind": "expect", "name": name, "check": check}
+	b.steps = append(b.steps, applyOpts(s, opts))
+	return b
+}
+
+// 控制流
+//
+// Branch / Loop / Dispatch 接受 builder 函数,允许嵌套构造子树。
+// 子树共享父 builder 的 strategy/timeout,但 steps 独立。
+func (b *B) Branch(when Predicate, thenBuild func(*B), elseBuild func(*B)) *B {
+	thenSteps := buildSub(b, thenBuild)
+	elseSteps := buildSub(b, elseBuild)
+	s := Step{"kind": "branch", "when": when, "then": thenSteps}
+	if len(elseSteps) > 0 {
+		s["else"] = elseSteps
 	}
-	defer func() { <-sem }()
+	b.steps = append(b.steps, s)
+	return b
+}
 
-	bctx, cancelB := chromedp.NewContext(sharedAllocCtx)
-	defer cancelB()
+func (b *B) Loop(times int, body func(*B)) *B {
+	bodySteps := buildSub(b, body)
+	b.steps = append(b.steps, Step{"kind": "loop", "times": times, "body": bodySteps})
+	return b
+}
 
-	timed, cancelT := context.WithTimeout(bctx, 30*time.Second)
-	defer cancelT()
+// Dispatch 读一个值 → 按值走对应分支。等价于 read + 嵌套 branch。
+//
+// 实现细节:为了 IR 输出确定性(便于 diff / 缓存 hash),cases 的 key 在编译时排序后展开。
+// 排序对运行时行为无影响 — 所有 branch 的 else 都是空,顺序不会改变结果。
+func (b *B) Dispatch(name string, source ValueSource, cases Cases, opts ...Opt) *B {
+	b.Read(name, source, opts...)
 
-	var raw string
-	if err := chromedp.Run(timed,
-		chromedp.Navigate(applyAuditParam(url)),
-		chromedp.Poll(`typeof window.WebOps === 'object' && typeof window.WebOps.describe === 'function'`, nil),
-		chromedp.Evaluate(`JSON.stringify(window.WebOps.describe())`, &raw),
-	); err != nil {
-		return nil, fmt.Errorf("describe: %w", err)
+	keys := make([]string, 0, len(cases))
+	for k := range cases {
+		keys = append(keys, k)
 	}
-	return json.RawMessage(raw), nil
+	sort.Strings(keys)
+
+	// 嵌套展开:case_1 命中 → branch_1.then;否则 case_2 命中 → branch_2.then;...
+	// else 链最终落到空 step list。
+	for _, k := range keys {
+		fn := cases[k]
+		b.Branch(ReadEq(name, k), fn, nil)
+	}
+	return b
 }
 
-// pageDescription — Go 侧只取批量调度需要的字段,其它当 RawMessage 透传给 LLM。
-type pageDescription struct {
-	GameIntent string             `json:"gameIntent"`
-	Scenarios  []scenarioMetadata `json:"scenarios"`
+// buildSub 用父 builder 的 strategy/timeout/store 新建一个临时 builder,跑用户的 build fn,
+// 返回它产出的 steps。nil build fn 返回空 slice(供 Branch 的 else 用)。
+func buildSub(parent *B, fn func(*B)) []Step {
+	if fn == nil {
+		return []Step{}
+	}
+	sub := &B{
+		scenarioID:     parent.scenarioID,
+		strategy:       parent.strategy,
+		timeoutMs:      parent.timeoutMs,
+		continueOnFail: parent.continueOnFail,
+		store:          parent.store,
+		steps:          []Step{},
+	}
+	fn(sub)
+	return sub.steps
 }
 
-type scenarioMetadata struct {
-	ID         string   `json:"id"`
-	Hypothesis string   `json:"hypothesis"`
-	Intent     string   `json:"intent"`
-	Tags       []string `json:"tags"`
+// Build 把 builder 收尾为 InlineScript。
+func (b *B) Build() InlineScript {
+	return InlineScript{
+		ScenarioID:           b.scenarioID,
+		Strategy:             b.strategy,
+		ContinueOnExpectFail: b.continueOnFail,
+		SessionTimeoutMs:     b.timeoutMs,
+		Steps:                b.steps,
+		Store:                b.store,
+	}
 }
 
-type scenarioResult struct {
+// ---------- Scenario / Audit 类型 ----------
+
+type Scenario struct {
+	ID         string       `json:"id"`
+	Hypothesis string       `json:"hypothesis,omitempty"`
+	Intent     string       `json:"intent,omitempty"`
+	Tags       []string     `json:"tags,omitempty"`
+	Script     InlineScript `json:"-"`
+}
+
+type ScenarioResult struct {
 	ScenarioID string          `json:"scenarioId"`
-	Hypothesis string          `json:"hypothesis"`
+	Hypothesis string          `json:"hypothesis,omitempty"`
 	Intent     string          `json:"intent,omitempty"`
 	Tags       []string        `json:"tags,omitempty"`
 	Payload    json.RawMessage `json:"payload,omitempty"`
@@ -374,271 +331,399 @@ type scenarioResult struct {
 	DurationMs int64           `json:"durationMs"`
 }
 
-// ---------- HTTP handlers ----------
-
-// /webops/diagnose — 单 scenario 模式,保留 V4.0 行为兼容。
-func handleDiagnose(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		URL        string `json:"url"`
-		ScenarioID string `json:"scenarioId"`
-		Hypothesis string `json:"hypothesis,omitempty"`
-		SkipLLM    bool   `json:"skipLLM,omitempty"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "bad json: " + err.Error()})
-		return
-	}
-	if req.URL == "" || req.ScenarioID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "url and scenarioId required"})
-		return
-	}
-
-	startedAt := time.Now()
-	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
-	defer cancel()
-
-	payload, err := runOneScenario(ctx, req.URL, req.ScenarioID)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"ok": false, "error": err.Error(),
-			"durationMs": time.Since(startedAt).Milliseconds(),
-		})
-		return
-	}
-
-	out := map[string]any{
-		"ok":         true,
-		"payload":    json.RawMessage(payload),
-		"durationMs": time.Since(startedAt).Milliseconds(),
-	}
-
-	if !req.SkipLLM {
-		apiKey := os.Getenv("ANTHROPIC_API_KEY")
-		if apiKey == "" {
-			out["llmSkipped"] = "ANTHROPIC_API_KEY not set"
-		} else {
-			verdict, err := callLLMSingle(ctx, apiKey, payload, req.Hypothesis)
-			if err != nil {
-				out["llmError"] = err.Error()
-			} else {
-				out["verdict"] = verdict
-			}
-		}
-		out["durationMs"] = time.Since(startedAt).Milliseconds()
-	}
-
-	writeJSON(w, http.StatusOK, out)
+type AuditRequest struct {
+	URL         string
+	GameIntent  string
+	Scenarios   []Scenario
+	Concurrency int
+	SkipLLM     bool
+	LLMAPIKey   string
+	LLMModel    string
 }
 
-// /webops/diagnose-batch — 多 scenario 并发模式,聚合后一次 LLM 调用产出跨场景判决。
-func handleDiagnoseBatch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		URL         string   `json:"url"`
-		Scenarios   []string `json:"scenarios,omitempty"` // nil 或空 = 跑 describe 列表里的全部
-		Tags        []string `json:"tags,omitempty"`      // 按 tag 过滤(与 Scenarios 取并集后再过滤)
-		Concurrency int      `json:"concurrency,omitempty"`
-		SkipLLM     bool     `json:"skipLLM,omitempty"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "bad json: " + err.Error()})
-		return
-	}
-	if req.URL == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "url required"})
-		return
-	}
-
-	startedAt := time.Now()
-	ctx, cancel := context.WithTimeout(r.Context(), 600*time.Second)
-	defer cancel()
-
-	// 1. 拉 page description 拿 gameIntent + scenarios 元数据。
-	rawDesc, err := describePage(ctx, req.URL)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"ok": false, "error": "describe failed: " + err.Error(),
-		})
-		return
-	}
-	var desc pageDescription
-	if err := json.Unmarshal(rawDesc, &desc); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"ok": false, "error": "describe parse: " + err.Error(),
-		})
-		return
-	}
-
-	// 2. 决定要跑哪些 scenario:Scenarios 显式列表优先,然后 tags 再筛。
-	selected := selectScenarios(desc.Scenarios, req.Scenarios, req.Tags)
-	if len(selected) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"ok":    false,
-			"error": "no scenarios selected (empty registry, or filters excluded everything)",
-			"available": desc.Scenarios,
-		})
-		return
-	}
-
-	// 3. fan-out:每个 scenario 一个 fresh tab,errgroup 收集结果。
-	//    单个失败不取消整批,记 InfraError 让 LLM 看到"哪些没跑通"。
-	results := make([]scenarioResult, len(selected))
-	g, gctx := errgroup.WithContext(ctx)
-	for i, s := range selected {
-		i, s := i, s
-		g.Go(func() error {
-			t0 := time.Now()
-			payload, err := runOneScenario(gctx, req.URL, s.ID)
-			res := scenarioResult{
-				ScenarioID: s.ID,
-				Hypothesis: s.Hypothesis,
-				Intent:     s.Intent,
-				Tags:       s.Tags,
-				DurationMs: time.Since(t0).Milliseconds(),
-			}
-			if err != nil {
-				res.InfraError = err.Error()
-			} else {
-				res.Payload = json.RawMessage(payload)
-			}
-			results[i] = res
-			return nil // 单个失败不污染整批
-		})
-	}
-	_ = g.Wait()
-
-	out := map[string]any{
-		"ok":         true,
-		"gameIntent": desc.GameIntent,
-		"results":    results,
-		"durationMs": time.Since(startedAt).Milliseconds(),
-	}
-
-	// 4. 聚合判决:一次 LLM 调用拿跨场景 verdict。
-	if !req.SkipLLM {
-		apiKey := os.Getenv("ANTHROPIC_API_KEY")
-		if apiKey == "" {
-			out["llmSkipped"] = "ANTHROPIC_API_KEY not set"
-		} else {
-			verdict, err := callLLMBatch(ctx, apiKey, desc.GameIntent, results)
-			if err != nil {
-				out["llmError"] = err.Error()
-			} else {
-				out["verdict"] = verdict
-			}
-		}
-		out["durationMs"] = time.Since(startedAt).Milliseconds()
-	}
-
-	writeJSON(w, http.StatusOK, out)
+type AuditResult struct {
+	GameIntent string           `json:"gameIntent"`
+	Results    []ScenarioResult `json:"results"`
+	Verdict    string           `json:"verdict,omitempty"`    // 原始 LLM JSON 字符串
+	LLMError   string           `json:"llmError,omitempty"`
+	LLMSkipped string           `json:"llmSkipped,omitempty"`
+	DurationMs int64            `json:"durationMs"`
 }
 
-// selectScenarios — 应用 scenarios 显式列表 + tags 过滤。
+// ---------- 共享 chromedp 进程 ----------
+
+var (
+	browserMu    sync.Mutex
+	browserAlloc context.Context
+	browserCanc  context.CancelFunc
+	browserOnce  sync.Once
+)
+
+func ensureBrowser() (context.Context, error) {
+	browserMu.Lock()
+	defer browserMu.Unlock()
+	if browserAlloc != nil {
+		return browserAlloc, nil
+	}
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+	)
+	browserAlloc, browserCanc = chromedp.NewExecAllocator(context.Background(), opts...)
+	return browserAlloc, nil
+}
+
+// Close 关闭共享 chromedp 进程。一般在程序退出前调一次。
+func Close() {
+	browserMu.Lock()
+	defer browserMu.Unlock()
+	if browserCanc != nil {
+		browserCanc()
+		browserCanc = nil
+		browserAlloc = nil
+	}
+}
+
+// ---------- applyAuditParam ----------
+
+func applyAuditParam(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		// 解析不动就拼字符串
+		sep := "?"
+		if strings.Contains(rawURL, "?") {
+			sep = "&"
+		}
+		return rawURL + sep + auditParam
+	}
+	q := u.Query()
+	parts := strings.SplitN(auditParam, "=", 2)
+	if len(parts) == 2 {
+		q.Set(parts[0], parts[1])
+	} else {
+		q.Set(parts[0], "1")
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// ---------- runOneInline ----------
+
+// awaitPromise 是 chromedp.EvaluateAction 的修饰器:让 evaluate 等待返回值是 Promise 时 await。
+func awaitPromise(p *runtime.EvaluateParams) *runtime.EvaluateParams {
+	return p.WithAwaitPromise(true)
+}
+
+// runOneInline 跑一个 scenario:开新 tab → navigate → 等 WebOps.runInline 就位 → evaluate → 收 payload → 关 tab。
 //
-// 规则:
-//   - scenarios 非空: 只保留这些 ID。其它的丢掉。
-//   - tags 非空:    再保留至少有一个 tag 命中的。
-//   - 两者都空:    返回全部。
-//   - scenarios 里给了不存在的 ID: 跳过(不报错,不影响其它合法 ID)。
-func selectScenarios(all []scenarioMetadata, ids, tags []string) []scenarioMetadata {
-	idSet := map[string]bool{}
-	for _, id := range ids {
-		idSet[id] = true
-	}
-	tagSet := map[string]bool{}
-	for _, t := range tags {
-		tagSet[t] = true
+// 注意:这里把 IR 与 meta 都序列化为 JSON,然后字面量嵌入到 evaluate 表达式里。
+// 这是安全的 — JSON 是 JS 字面量的合法子集,不需要额外转义。
+func runOneInline(ctx context.Context, sharedAlloc context.Context, fullURL string, sc Scenario) ScenarioResult {
+	start := time.Now()
+	res := ScenarioResult{
+		ScenarioID: sc.ID,
+		Hypothesis: sc.Hypothesis,
+		Intent:     sc.Intent,
+		Tags:       sc.Tags,
 	}
 
-	out := make([]scenarioMetadata, 0, len(all))
-	for _, s := range all {
-		if len(idSet) > 0 && !idSet[s.ID] {
-			continue
-		}
-		if len(tagSet) > 0 {
-			hit := false
-			for _, t := range s.Tags {
-				if tagSet[t] {
-					hit = true
-					break
-				}
-			}
-			if !hit {
-				continue
-			}
-		}
-		out = append(out, s)
-	}
-	return out
-}
+	tabCtx, cancelTab := chromedp.NewContext(sharedAlloc)
+	defer cancelTab()
 
-// /webops/describe — 拿 gameIntent + scenarios 元数据,便于做后台面板。
-func handleDescribe(w http.ResponseWriter, r *http.Request) {
-	url := r.URL.Query().Get("url")
-	if url == "" {
-		http.Error(w, "url query param required", http.StatusBadRequest)
-		return
+	navCtx, cancelNav := context.WithTimeout(tabCtx, NavTimeout)
+	defer cancelNav()
+	if err := chromedp.Run(navCtx, chromedp.Navigate(fullURL)); err != nil {
+		res.InfraError = "navigate: " + err.Error()
+		res.DurationMs = time.Since(start).Milliseconds()
+		return res
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
-	raw, err := describePage(ctx, url)
+
+	// 等 window.WebOps.runInline 挂载
+	pollCtx, cancelPoll := context.WithTimeout(tabCtx, 15*time.Second)
+	defer cancelPoll()
+	if err := chromedp.Run(pollCtx,
+		chromedp.Poll(`typeof window.WebOps === 'object' && typeof window.WebOps.runInline === 'function'`, nil),
+	); err != nil {
+		res.InfraError = "wait WebOps.runInline: " + err.Error()
+		res.DurationMs = time.Since(start).Milliseconds()
+		return res
+	}
+
+	// 编码 IR 与 meta
+	scriptJSON, err := json.Marshal(sc.Script)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
-		return
+		res.InfraError = "marshal script: " + err.Error()
+		res.DurationMs = time.Since(start).Milliseconds()
+		return res
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"description": raw})
+	meta := map[string]any{}
+	if sc.Hypothesis != "" {
+		meta["hypothesis"] = sc.Hypothesis
+	}
+	if sc.Intent != "" {
+		meta["intent"] = sc.Intent
+	}
+	if len(sc.Tags) > 0 {
+		meta["tags"] = sc.Tags
+	}
+	metaJSON, _ := json.Marshal(meta)
+
+	// 执行
+	runCtxInner, cancelRun := context.WithTimeout(tabCtx, RunTimeout)
+	defer cancelRun()
+
+	var payloadStr string
+	expr := fmt.Sprintf(`window.WebOps.runInline(%s, %s)`, scriptJSON, metaJSON)
+	if err := chromedp.Run(runCtxInner,
+		chromedp.ActionFunc(func(c context.Context) error {
+			p := runtime.Evaluate(expr).WithReturnByValue(true)
+			p = awaitPromise(p)
+			r, ex, err := p.Do(c)
+			if err != nil {
+				return err
+			}
+			if ex != nil {
+				return errors.New(ex.Text)
+			}
+			// runInline 返回 JSON 字符串
+			if err := json.Unmarshal(r.Value, &payloadStr); err != nil {
+				return fmt.Errorf("decode result: %w (raw=%s)", err, string(r.Value))
+			}
+			return nil
+		}),
+	); err != nil {
+		res.InfraError = "evaluate runInline: " + err.Error()
+		res.DurationMs = time.Since(start).Milliseconds()
+		return res
+	}
+
+	res.Payload = json.RawMessage(payloadStr)
+	res.DurationMs = time.Since(start).Milliseconds()
+	return res
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
+// ---------- Audit ----------
 
-// ---------- main ----------
-
-func main() {
-	flag.IntVar(&maxConcurrency, "concurrency", envInt("CONCURRENCY", maxConcurrency), "max parallel browser tabs")
-	flag.StringVar(&listenAddr, "addr", envStr("ADDR", listenAddr), "listen address")
-	flag.StringVar(&llmModel, "model", envStr("LLM_MODEL", llmModel), "Anthropic model id")
-	flag.Parse()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/webops/diagnose", handleDiagnose)
-	mux.HandleFunc("/webops/diagnose-batch", handleDiagnoseBatch)
-	mux.HandleFunc("/webops/describe", handleDescribe)
-
-	log.Printf("[webops] listening on %s (concurrency=%d, model=%s, audit-param=%q)",
-		listenAddr, maxConcurrency, llmModel, auditParam)
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		log.Println("[warn] ANTHROPIC_API_KEY not set; LLM calls will be skipped or noted")
+// Audit 是 V5 唯一对外的核心入口。
+//
+// 行为:
+//   - 启动(或复用)共享 chromedp 进程
+//   - 按 Concurrency 限流并发跑所有 scenario(每个独立 tab)
+//   - 收齐 LLMPayload 后,如果没禁 LLM,做一次 batch verdict 调用
+//   - 返回 AuditResult,InfraError 在 ScenarioResult 内,LLM 错误在顶层
+//
+// 单个 scenario 的失败不会让 Audit 整体返回 error;只有"全员都没跑通"或"参数错"才会。
+func Audit(ctx context.Context, req AuditRequest) (*AuditResult, error) {
+	if req.URL == "" {
+		return nil, errors.New("AuditRequest.URL is empty")
+	}
+	if len(req.Scenarios) == 0 {
+		return nil, errors.New("AuditRequest.Scenarios is empty")
 	}
 
-	srv := &http.Server{Addr: listenAddr, Handler: mux}
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
+	start := time.Now()
+	conc := req.Concurrency
+	if conc <= 0 {
+		conc = DefaultConcurrency
 	}
-}
 
-func envStr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	sharedAlloc, err := ensureBrowser()
+	if err != nil {
+		return nil, fmt.Errorf("browser: %w", err)
 	}
-	return def
-}
 
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
+	fullURL := applyAuditParam(req.URL)
+	results := make([]ScenarioResult, len(req.Scenarios))
+	sem := make(chan struct{}, conc)
+	var wg sync.WaitGroup
+
+	for i, sc := range req.Scenarios {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, sc Scenario) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[idx] = runOneInline(ctx, sharedAlloc, fullURL, sc)
+		}(i, sc)
+	}
+	wg.Wait()
+
+	out := &AuditResult{
+		GameIntent: req.GameIntent,
+		Results:    results,
+		DurationMs: time.Since(start).Milliseconds(),
+	}
+
+	// 至少一个 scenario 有 payload 才送 LLM
+	hasPayload := false
+	for _, r := range results {
+		if len(r.Payload) > 0 {
+			hasPayload = true
+			break
 		}
 	}
-	return def
+	if !hasPayload {
+		out.LLMSkipped = "no scenario produced a payload"
+		return out, nil
+	}
+	if req.SkipLLM {
+		out.LLMSkipped = "SkipLLM=true"
+		return out, nil
+	}
+
+	apiKey := req.LLMAPIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+	}
+	if apiKey == "" {
+		out.LLMSkipped = "no API key (LLMAPIKey nor ANTHROPIC_API_KEY)"
+		return out, nil
+	}
+	model := req.LLMModel
+	if model == "" {
+		model = DefaultLLMModel
+	}
+
+	verdict, llmErr := callLLMBatch(ctx, apiKey, model, req.GameIntent, results)
+	if llmErr != nil {
+		out.LLMError = llmErr.Error()
+	} else {
+		out.Verdict = verdict
+	}
+	out.DurationMs = time.Since(start).Milliseconds()
+	return out, nil
+}
+
+// ---------- LLM batch verdict ----------
+
+const batchSystemPrompt = `你是一个游戏审计代理,负责跨多个场景对一款游戏做综合判决。
+输入:
+  - gameIntent:游戏的总体设计意图。
+  - scenarios:每个场景包含 hypothesis、intent、tags 和实测产出的 LLMPayload(facts + verdict)。
+任务:
+  1. 对每个场景给出 verdict (PASS / PARTIAL / FAIL / INFRA_FAIL) 和 0-100 的 score。
+  2. 找出跨场景的共同问题(同一根因导致多个场景失败)。
+  3. 给出 root cause 与建议的修复方向(target: code / script / both;file 给出最可能的文件;change 给出修改思路)。
+输出严格 JSON,格式:
+{
+  "perScenario": [{"scenarioId": "...", "verdict": "PASS|PARTIAL|FAIL|INFRA_FAIL", "score": 0-100, "evidence": ["..."]}],
+  "crossScenarioFindings": [{"pattern": "...", "scenariosAffected": ["..."], "evidence": "..."}],
+  "rootCauses": [{"issue": "...", "suggestedFix": {"target": "code|script|both", "file": "...", "change": "..."}}],
+  "notes": "..."
+}
+不要输出 Markdown 或代码围栏,只输出 JSON 对象本体。`
+
+func callLLMBatch(ctx context.Context, apiKey, model, gameIntent string, results []ScenarioResult) (string, error) {
+	payload := map[string]any{
+		"gameIntent": gameIntent,
+		"scenarios":  results,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	return callAnthropic(ctx, apiKey, model, batchSystemPrompt, string(body))
+}
+
+// ---------- Anthropic HTTP + 重试 ----------
+
+func callAnthropic(ctx context.Context, apiKey, model, systemPrompt, userContent string) (string, error) {
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			d := backoff(attempt)
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(d):
+			}
+		}
+		text, retryAfter, err := callAnthropicOnce(ctx, apiKey, model, systemPrompt, userContent)
+		if err == nil {
+			return text, nil
+		}
+		lastErr = err
+		if retryAfter > 0 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(retryAfter):
+			}
+		}
+	}
+	return "", lastErr
+}
+
+func callAnthropicOnce(ctx context.Context, apiKey, model, systemPrompt, userContent string) (string, time.Duration, error) {
+	reqBody := map[string]any{
+		"model":      model,
+		"max_tokens": 8192,
+		"system":     systemPrompt,
+		"messages": []map[string]any{
+			{"role": "user", "content": userContent},
+		},
+	}
+	body, _ := json.Marshal(reqBody)
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", strings.NewReader(string(body)))
+	if err != nil {
+		return "", 0, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", apiKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+		return "", parseRetryAfter(resp.Header.Get("Retry-After")), fmt.Errorf("anthropic HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+	if resp.StatusCode != 200 {
+		return "", 0, fmt.Errorf("anthropic HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var parsed struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return "", 0, err
+	}
+	var sb strings.Builder
+	for _, c := range parsed.Content {
+		if c.Type == "text" {
+			sb.WriteString(c.Text)
+		}
+	}
+	return sb.String(), 0, nil
+}
+
+func parseRetryAfter(s string) time.Duration {
+	if s == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return time.Duration(n) * time.Second
+	}
+	return 0
+}
+
+func backoff(attempt int) time.Duration {
+	base := time.Duration(1<<attempt) * time.Second
+	if base > 30*time.Second {
+		base = 30 * time.Second
+	}
+	return base
 }

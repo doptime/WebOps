@@ -1,10 +1,10 @@
 // core/dom-telemetry.ts
-// DOM 探针 — 60fps 物理采样，结合视觉权重和 Rank 排序。
+// DOM 探针 — 60fps 物理采样,结合视觉权重和 Rank 排序。
 //
-// V4 改动：
-//   - 不再独立 RAF，sample() 由 SessionRunner 在统一时钟下驱动。
-//   - 收紧到声明式 (data-vt-id) 模式：避免 V3 的 "smart sniffer" 在复杂 R3F 场景误识别。
-//   - 渲染不可见时 (rect 全 0) 仍保留 registry 条目，不再误删 — 因为 R3F 元素短暂出场是正常的。
+// V4 改动:
+//   - 不再独立 RAF,sample() 由 SessionRunner 在统一时钟下驱动。
+//   - 收紧到声明式 (data-vt-id) 模式:避免 V3 的 "smart sniffer" 在复杂 R3F 场景误识别。
+//   - 渲染不可见时 (rect 全 0) 仍保留 registry 条目,不再误删 — 因为 R3F 元素短暂出场是正常的。
 
 import { computeVisualWeight } from './core--visual-attention';
 import { AggregatedMetric, emptyMetric, pushValue } from './core--kline';
@@ -20,7 +20,7 @@ export interface DOMNode {
 }
 
 export interface DOMSnapshot {
-  /** 当前帧每个 vt-id 的 K 线快照（之后会被 harvest 清空翻页）。 */
+  /** 当前帧每个 vt-id 的 K 线快照(之后会被 harvest 清空翻页)。 */
   nodes: Record<string, {
     weight: AggregatedMetric;
     rank: AggregatedMetric;
@@ -131,7 +131,7 @@ export class DOMTelemetry {
     return snap;
   }
 
-  /** 主动注册一个外部追踪点（如 R3F 的 invisible-tracker）。 */
+  /** 主动注册一个外部追踪点(如 R3F 的 invisible-tracker)。 */
   register(id: string, element: HTMLElement, watch: string[] = []): void {
     if (this.registry.has(id)) return;
     this.registry.set(id, {
@@ -189,17 +189,27 @@ export class DOMTelemetry {
     });
   }
 
-  private parseRotation(t?: string): number {
-    if (!t || t === 'none') return 0;
-    const parts = t.split('(')[1]?.split(')')[0]?.split(',');
-    if (!parts || parts.length < 2) return 0;
-    return Math.round(Math.atan2(parseFloat(parts[1]), parseFloat(parts[0])) * (180 / Math.PI));
+  /** 把 computed transform 解析成 DOMMatrix。'none' / 解析失败 → 单位矩阵。
+   *  原生 DOMMatrix 由浏览器 C++ 解析,天然兼容 matrix3d,
+   *  不会像手写 split(',') 那样在 3D 变换(R3F 常态)下取错分量或崩。 */
+  private toMatrix(t?: string): DOMMatrix {
+    if (!t || t === 'none') return new DOMMatrix();
+    try {
+      return new DOMMatrix(t);
+    } catch {
+      return new DOMMatrix();
+    }
   }
 
+  /** 旋转角(度,整数)— 等价于 atan2(b, a)。 */
+  private parseRotation(t?: string): number {
+    const m = this.toMatrix(t);
+    return Math.round(Math.atan2(m.b, m.a) * (180 / Math.PI));
+  }
+
+  /** X 轴缩放系数 — 等价于 hypot(a, b)。scale(0) 会如实返回 0。 */
   private parseScale(t?: string): number {
-    if (!t || t === 'none') return 1;
-    const parts = t.split('(')[1]?.split(')')[0]?.split(',');
-    if (!parts || parts.length < 2) return 1;
-    return Math.sqrt(parseFloat(parts[0]) ** 2 + parseFloat(parts[1]) ** 2);
+    const m = this.toMatrix(t);
+    return Math.hypot(m.a, m.b);
   }
 }

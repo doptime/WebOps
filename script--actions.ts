@@ -1,32 +1,15 @@
 // script/actions.ts
 // 动作执行器 — 把 StepIR 翻译为浏览器事件。
-// V3 中这部分逻辑在 TimelineExecutor 里。V4 把它拆出来，让 SessionRunner 直接调用。
+// V3 中这部分逻辑在 TimelineExecutor 里。V4 把它拆出来,让 SessionRunner 直接调用。
 
 import { TargetSpec, Strategy } from './script--Script';
 import { VirtualChannel } from './core--virtual-channel';
 
-function cubicBezier(t: number, p0: number, p1: number, p2: number, p3: number): number {
-  const u = 1 - t;
-  return u * u * u * p0 + 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t * p3;
-}
-
-function humanLikePath(sx: number, sy: number, ex: number, ey: number, steps: number) {
-  const path: { x: number; y: number }[] = [];
-  const c1x = sx + (ex - sx) * 0.3 + (Math.random() - 0.5) * 50;
-  const c1y = sy + (ey - sy) * 0.1 + (Math.random() - 0.5) * 30;
-  const c2x = sx + (ex - sx) * 0.7 + (Math.random() - 0.5) * 50;
-  const c2y = sy + (ey - sy) * 0.9 + (Math.random() - 0.5) * 30;
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-    path.push({
-      x: cubicBezier(eased, sx, c1x, c2x, ex),
-      y: cubicBezier(eased, sy, c1y, c2y, ey)
-    });
-  }
-  return path;
-}
-
+// V4.1: 删除手写三阶贝塞尔 + 拟人轨迹。
+//   本工具是第一方内部审计器(headless chromedp 跑自家游戏),没有反爬对抗需求。
+//   humanLikePath 的控制点掺了 Math.random(),对审计而言随机抖动是在主动破坏可复现性。
+//   一切移动统一走确定性 linearPath:既可复现,又仍逐点派发 pointermove,
+//   让游戏侧的 hover / drag 监听照样被触发。
 function linearPath(sx: number, sy: number, ex: number, ey: number, steps: number) {
   const out: { x: number; y: number }[] = [];
   for (let i = 0; i <= steps; i++) {
@@ -45,14 +28,10 @@ export class ActionDispatcher {
 
   constructor(virtualChannel: VirtualChannel) {
     this.vc = virtualChannel;
-    if (typeof document !== 'undefined') {
-      document.addEventListener('mousemove', (e) => {
-        if (!this.isMouseDown) {
-          this.cursorX = e.clientX;
-          this.cursorY = e.clientY;
-        }
-      });
-    }
+    // V4.1: 不再在构造期向 document 挂全局 mousemove 监听。
+    //   原监听只为捕获"真人"光标位置,但 headless 审计里没有真人,
+    //   光标位置完全由 moveCursor / dispatch 自己维护。该监听是纯死重,
+    //   且因从不注销,在多 tab 反复冷启动场景下是潜在泄漏源。
   }
 
   resolve(target: TargetSpec): { x: number; y: number } | null {
@@ -83,7 +62,7 @@ export class ActionDispatcher {
       this.cursorY = to.y;
       return;
     }
-    const path = humanLikePath(this.cursorX, this.cursorY, to.x, to.y, 20);
+    const path = linearPath(this.cursorX, this.cursorY, to.x, to.y, 20);
     for (const p of path) {
       this.dispatch('mousemove', p.x, p.y);
       this.cursorX = p.x;
@@ -98,7 +77,7 @@ export class ActionDispatcher {
     await this.moveCursor(pos, strategy);
 
     if (mode === 'native' && typeof target === 'string') {
-      // 直接调 DOM .click()，跳过 PointerEvent —— 适合普通 button
+      // 直接调 DOM .click(),跳过 PointerEvent —— 适合普通 button
       const sel = target.startsWith('[') || target.startsWith('.') || target.startsWith('#')
         ? target : `[data-vt-id="${target}"]`;
       const el = document.querySelector<HTMLElement>(sel);
@@ -122,9 +101,8 @@ export class ActionDispatcher {
     this.isMouseDown = true;
     this.dispatch('mousedown', a.x, a.y);
     const steps = Math.max(10, Math.floor(durationMs / 16));
-    const path = strategy === 'human_like'
-      ? humanLikePath(a.x, a.y, b.x, b.y, steps)
-      : linearPath(a.x, a.y, b.x, b.y, steps);
+    // strategy 仍保留在签名里以兼容 Script DSL,但路径恒为确定性 linear。
+    const path = linearPath(a.x, a.y, b.x, b.y, steps);
     for (const p of path) {
       this.dispatch('mousemove', p.x, p.y);
       this.cursorX = p.x;
@@ -148,7 +126,7 @@ export class ActionDispatcher {
     return true;
   }
 
-  /** 派发 keydown + keyup，适合像 SortingChaos 那样的 a/s/d 按键玩法。 */
+  /** 派发 keydown + keyup,适合像 SortingChaos 那样的 a/s/d 按键玩法。 */
   key(key: string): boolean {
     const target = document.activeElement || document.body;
     const init: KeyboardEventInit = { key, bubbles: true, cancelable: true };

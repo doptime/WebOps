@@ -10,7 +10,7 @@
 //      生产环境无副作用:没有 push 函数时全部 set() 走原路。
 //   3. shouldEnableWebOps —— URL 闸门,Bootstrap 用它决定是否要 dynamic-import @/webops。
 //
-// 完整的 webops 单例(SessionRunner / Script / register / run / describe)在 @/webops 里,
+// 完整的 webops 单例(SessionRunner / register / run / describe)在 @/webops 里,
 // 由 Bootstrap 在 shouldEnableWebOps()=true 时 await import 进来。
 
 export { useTrack, usePushSignal, useSignalBinding } from './react--useTrack';
@@ -27,13 +27,10 @@ export { withTelemetry, setTelemetryPushFn, clearTelemetryPushFn } from './react
  * 用法:
  *   useEffect(() => {
  *     if (!shouldEnableWebOps()) return;
- *     (async () => {
- *       const { webops } = await import('@/webops');
- *       webops.register('perfect-player', { ... });
- *     })();
+ *     import('@/webops');
  *   }, []);
  *
- * 参数与 webops.go 里的 const auditParam = "webops=1" 必须保持一致。
+ * 参数与 webops/webops.go 里的 const auditParam = "webops=1" 必须保持一致。
  * 要换名字(挡偶然访客),两边一起改。
  */
 export function shouldEnableWebOps(opts: {

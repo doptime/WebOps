@@ -3,21 +3,18 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "jsx": "preserve",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "allowJs": false,
-    "resolveJsonModule": true,
+    "jsx": "preserve",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "baseUrl": ".",
     "paths": {
-      "@/webops": ["./agent.ts"]
+      "@/webops":         ["./agent.ts"],
+      "@/webops/runtime": ["./runtime.ts"]
     }
   },
-  "include": ["*.ts", "*.tsx"],
-  "exclude": ["node_modules", "*.go", "dist"]
+  "include": ["*.ts"],
+  "exclude": ["node_modules"]
 }

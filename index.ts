@@ -1,14 +1,13 @@
-// index.ts — webops V4 主入口。
+// index.ts — webops V5 主入口。
 //
-// V4.1 改动:
-//   - 加 runSession in-flight 锁,防止同一 tab 内并发调用导致 push 函数互相覆盖。
-//     V4 部署模型是"一个 chromedp tab 跑一次 session",在 tab 内是单实例。
-//     这把锁是防御性的:让误调用变成显式报错,而不是数据静默串台。
-//   - runSession opts 接收 intent / tags,透传给 buildLLMPayload(进 LLMPayload)。
-//   - 不再导出 LLM 前端调用工具(原 llm--prompt.ts 已删除)。LLM 调用全部走 Go 后端。
+// V5 改动:
+//   - 不再导出 Script DSL builder(已搬到 Go 端)。
+//   - 导出 compileIR + InlineScript 类型,供 agent.ts 在 runInline 时使用。
+//   - runSession 与 V4.1 完全一致:in-flight 锁 + telemetry push 注入。
 
-export { Script } from './script--Script';
 export type { CompiledScript, StepIR, Strategy, TargetSpec } from './script--Script';
+export { compileIR } from './script--ir';
+export type { InlineScript, Predicate, ValueSource, IRStep } from './script--ir';
 
 export { SessionRunner } from './session--SessionRunner';
 export type { SessionReport, TelemetryFrame, ActionRecord, RunnerOptions } from './session--SessionRunner';
@@ -39,7 +38,6 @@ let inflight = false;
 
 /**
  * 一站式: 跑一个 session 并直接拿到 LLM-ready payload。
- * 这是最常用的入口 —— 业务侧 `import { runSession } from '@/webops'` 就够了。
  *
  * 同 tab 同时只能跑一个 session: 第二次调用会立刻 reject。
  * 如果你需要并发,在 Go 后端用多个 chromedp tab(每 tab 各自有独立的 window)。

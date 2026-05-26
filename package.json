@@ -1,27 +1,25 @@
 {
-  "name": "@webops/v4",
-  "version": "4.0.0",
-  "description": "WebOps V4 — One-call session telemetry for React/Next.js/R3F apps",
+  "name": "@webops/v5",
+  "version": "5.0.0",
+  "description": "WebOps V5 — Go-authored inline scripts. K-line telemetry + chromedp + LLM batch verdict, all in one harness.",
   "type": "module",
   "main": "./agent.ts",
   "exports": {
-    ".": "./agent.ts",
-    "./script": "./script--Script.ts",
+    ".":         "./agent.ts",
+    "./runtime": "./runtime.ts",
+    "./script":  "./script--Script.ts",
+    "./ir":      "./script--ir.ts",
     "./session": "./session--SessionRunner.ts",
-    "./report": "./report--ReportBuilder.ts",
-    "./react": "./react--useTrack.ts",
-    "./zustand": "./react--zustand-telemetry.ts",
-    "./llm": "./llm--prompt.ts"
+    "./report":  "./report--ReportBuilder.ts",
+    "./react":   "./react--useTrack.ts",
+    "./zustand": "./react--zustand-telemetry.ts"
   },
   "peerDependencies": {
-    "react": ">=18",
-    "zustand": ">=4"
-  },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
+    "react":   ">=18.0.0",
+    "zustand": ">=4.0.0"
   },
   "devDependencies": {
-    "typescript": "^5.4.0",
+    "typescript":  "^5.4.0",
     "@types/react": "^18.2.0"
   }
 }

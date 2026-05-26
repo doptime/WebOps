@@ -1,179 +1,208 @@
-# WebOps V4.1 — 单文件平铺布局
+# WebOps V5 — Go-Authored Inline Scripts
 
-> "One call. Full session. LLM-ready. Now in batch."
+> "One call. Full session. LLM-ready. Scripts live with their tests."
 
-V4 把 V3 的四步流程 (`start → execute → wait → analyze`) 收敛为一次原子调用 `runSession(script)`,产出可直接送给大模型的 `LLMPayload`。
+V5 把 V4.1 的"TS 端剧本注册 + HTTP 服务"模型收敛为"Go 端直接用 builder 拼脚本,通过 chromedp tab 内联送进浏览器"。结果是:
 
-V4.1 在 V4 之上加了**三件事**:
-
-1. **意图三层结构**(game → scenario → action)— 让 LLM 看到的不再是干符号,而是带语义的因果链。
-2. **批量并发测试** `/webops/diagnose-batch` — Go 侧共享 Chrome 池 + 信号量,N 个 scenario 并发跑,单次 LLM 聚合判决。
-3. **`dispatch` macro** — 消除"读一个值 → branch×N"的高频臃肿模式。
-
-整个工程是**单层级文件结构**:不需要展开任何子目录就能看完所有文件。原本目录关系通过 `--` 命名前缀保留:`core--kline.ts` 表示"原本属于 core 目录的 kline 模块"。
+- **测试脚本与意图同处一处**:每个 scenario 的 `hypothesis` / `intent` / `tags` 与它的步骤实现都在同一个 Go 函数里,agent 读一个文件就能看到全貌。
+- **框架代码大幅瘦身**:删除 HTTP 服务 (`webops.go`)、删除 TS 端 registry/describe/register、删除独立 examples TS 文件,~1200 行 → 新增 ~830 行,净减 ~30%。
+- **保留全部探针、压缩、analyzer、双入口、`?webops=1` 闸门**:telemetry 一行未改,生产用户依然零侵入。
 
 ---
 
-## 完整文件清单(单层级)
+## 目录
+
+- [V5 改了什么](#v5-改了什么)
+- [文件清单](#文件清单单层级)
+- [一分钟接入](#一分钟接入三步)
+- [端到端流程](#端到端流程)
+- [并发模型(铁律)](#并发模型铁律)
+- [生产安全(双入口 + 动态 import)](#生产安全双入口--动态-import)
+- [Go Script DSL 完整参考](#go-script-dsl-完整参考)
+- [Predicate 词汇表](#predicate-词汇表)
+- [ValueSource 词汇表](#valuesource-词汇表)
+- [意图三层结构](#意图三层结构)
+- [完整剧本范例](#完整剧本范例)
+- [组件接入(TypeScript 侧不变)](#组件接入typescript-侧不变)
+- [Go 库 API](#go-库-api)
+- [LLMPayload 结构](#llmpayload-结构)
+- [V4.1 → V5 迁移指南](#v41--v5-迁移指南)
+- [FAQ / 排错](#faq--排错)
+
+---
+
+## V5 改了什么
+
+| 维度 | V4.1 | V5 |
+|---|---|---|
+| 测试脚本所在地 | TS 文件 (`examples--xxx--scripts.ts`) | Go 文件 (`coffee_cloze_test.go` 等) |
+| 脚本如何到浏览器 | TS 文件 import 进 Bootstrap → `webops.register(id, build)` → Go 调 `WebOps.run(id)` | Go builder 产 JSON IR → `chromedp.Evaluate("window.WebOps.runInline(IR)")` |
+| Go 后端 | 独立 HTTP server (`webops.go`),3 个端点 | 库 (`webops/webops.go`),调用方直接 import |
+| TS 端 registry / describe / register | 都有 | **全删** |
+| Bootstrap 复杂度 | 4-10 行 register | 1 行 `await import('@/webops')` |
+| 调试开关 | `?webops=1` | **不变** |
+| Telemetry / 压缩 / analyzer | — | **一行未改** |
+| 双入口 (`@/webops/runtime` 静 + `@/webops` 动) | — | **不变** |
+
+---
+
+## 文件清单(单层级)
 
 ```
-webops-v4/
-├── README.md                                          ← 单一文档源(本文件)
+webops-v5/
+├── README.md                                  ← 本文件
 ├── package.json
 ├── tsconfig.json
-├── webops.go                                          ← Go 后端,单文件,可直接 go run
 │
-├── agent.ts                                           ← [审计入口] 动态 import,含 webops 单例 + register/run
-├── runtime.ts                                         ← [运行时入口] 静态 import,含 hooks + 闸门
-├── index.ts                                           ← runSession 主入口 + in-flight 锁
+├── agent.ts                                   ← V5 改: ~30 行,只剩 runInline 入口
+├── runtime.ts                                 ← 不动
+├── index.ts                                   ← V5 改: 小改,删 Script 导出
 │
-├── core--kline.ts                                     ← OHLC K 线工具
-├── core--visual-attention.ts                          ← 视觉权重计算
-├── core--virtual-channel.ts                          ← 信号汇流通道
-├── core--dom-telemetry.ts                            ← DOM 探针
-├── core--audio-telemetry.ts                          ← 音频探针
-├── core--r3f-bridge.ts                               ← R3F 3D 场景桥接
+├── core--kline.ts                             ← 不动
+├── core--visual-attention.ts                  ← 不动
+├── core--virtual-channel.ts                   ← 不动
+├── core--dom-telemetry.ts                     ← 不动
+├── core--audio-telemetry.ts                   ← 不动
+├── core--r3f-bridge.ts                        ← 不动
 │
-├── script--Script.ts                                  ← Script DSL 链式构建器(含 dispatch)
-├── script--actions.ts                                 ← PointerEvent/键盘事件派发
+├── script--Script.ts                          ← V5 改: 瘦身为类型定义
+├── script--ir.ts                              ← V5 新增: IR + compileIR
+├── script--actions.ts                         ← 不动
 │
-├── session--SessionRunner.ts                          ← 一体化会话引擎(含 frame 上限)
+├── session--SessionRunner.ts                  ← 不动
 │
-├── report--compress.ts                                ← K 线压缩(±400ms 窗口)
-├── report--analyzer.ts                                ← 自动诊断
-├── report--ReportBuilder.ts                           ← LLMPayload 组装
+├── report--compress.ts                        ← 不动
+├── report--analyzer.ts                        ← 不动
+├── report--ReportBuilder.ts                   ← 不动
 │
-├── react--useTrack.ts                                 ← React Hook: 声明式追踪
-├── react--zustand-telemetry.ts                       ← Zustand middleware
+├── react--useTrack.ts                         ← 不动
+├── react--zustand-telemetry.ts                ← 不动
 │
-└── examples--angle-sorting--scripts.ts                ← 三个示范剧本
+└── webops/
+    └── webops.go                              ← V5 新增: Go 库,IR + builder + chromedp + LLM
 ```
+
+**已删除(对比 V4.1):**
+- `webops.go`(独立 HTTP server,功能搬入库)
+- `examples--*--scripts.ts`(全部剧本搬到 Go)
 
 ---
 
 ## 一分钟接入(三步)
 
-**Step 1.** Next.js 配两个 alias(完整 + 轻量):
+### Step 1. Next.js 配两个 alias(与 V4.1 一致)
 
 ```js
 // next.config.mjs
 import path from 'path';
 export default {
   webpack: (config) => {
-    // 完整入口: 仅在审计路径动态 import,产出独立 chunk,生产用户不下载
-    config.resolve.alias['@/webops'] = path.resolve('./webops-v4/agent.ts');
-    // 轻量入口: 游戏组件静态 import,生产 bundle 只多约 5KB 且无副作用
-    config.resolve.alias['@/webops/runtime'] = path.resolve('./webops-v4/runtime.ts');
+    // 完整入口:仅在审计路径动态 import,产出独立 chunk,生产用户不下载
+    config.resolve.alias['@/webops'] = path.resolve('./webops-v5/agent.ts');
+    // 轻量入口:游戏组件静态 import,生产 bundle 只多 ~5KB 且无副作用
+    config.resolve.alias['@/webops/runtime'] = path.resolve('./webops-v5/runtime.ts');
     return config;
   }
 };
 ```
 
-**Step 2.** 应用启动时动态加载审计 chunk + 注册剧本:
+### Step 2. Bootstrap 简化为一行 import
+
+V5 不再 `register()` — Go 端每次 navigate 后直接 inline 送脚本。Bootstrap 只负责把 `window.WebOps` 挂上。
 
 ```tsx
 'use client';
 import { useEffect } from 'react';
-// 静态 import: 仅 shouldEnableWebOps 闸门,~1KB
 import { shouldEnableWebOps } from '@/webops/runtime';
 
 export function WebOpsBootstrap() {
   useEffect(() => {
     if (!shouldEnableWebOps()) return;
-
-    // 动态 import: 审计 chunk + 剧本 chunk 并行下载,生产用户永远不会到这里
-    (async () => {
-      const [{ webops }, { perfectPlayer, lazyPlayer, clickPlayer }] = await Promise.all([
-        import('@/webops'),
-        import('@/games/angle-sorting/scripts'),
-      ]);
-
-      webops.setGameIntent(
-        '角度分类游戏:玩家根据落下卡片的角度类型(锐角/直角/钝角),' +
-        '按对应的 a/s/d 键(或点击按钮)分类。20 张卡 + 3 条命。'
-      );
-
-      webops.register('perfect-player', {
-        build: perfectPlayer,
-        intent: '验证按键-分类的因果链路实现正确',
-        hypothesis: '每次正确按键 → +100 分 + SFX_SUCCESS。20 张全对应得 ≥ 1500 分进 victory。',
-        tags: ['happy-path']
-      });
-
-      webops.register('lazy-player', {
-        build: lazyPlayer,
-        intent: '验证错误反馈与 gameover 终止逻辑',
-        hypothesis: '永远按 a:碰到 right/obtuse 卡应判错并扣 lives。3 次错误后进 gameover。',
-        tags: ['failure-path']
-      });
-
-      webops.register('click-player', {
-        build: clickPlayer,
-        intent: '验证鼠标 onClick 链路与键盘等价',
-        hypothesis: '点击 btn_acute 应等价于按 a。结果应与 perfect-player 一致。',
-        tags: ['happy-path', 'regression']
-      });
-    })();
+    // 动态 import,把 window.WebOps.runInline 挂载。无脚本注册。
+    import('@/webops');
   }, []);
   return null;
 }
 ```
 
-`shouldEnableWebOps()` 的判定规则:
+`shouldEnableWebOps()` 的判定与 V4.1 一致:
 1. URL 含 `?webops=1` → 激活(Go chromedp 走这条)
 2. `process.env.NODE_ENV === 'development'` → 激活(本地手动 audit 方便)
 3. 否则不激活
 
-异步启动是安全的: chromedp 用 `chromedp.Poll` 等待 `window.WebOps.describe` 出现才发起调用,审计 chunk 下载几百毫秒不影响功能,只在 timing 日志里能看到。
-
-**Step 3.** Game 组件三处接入(详见 [组件接入](#组件接入)),**注意从 `/runtime` 入口 import**:
+### Step 3. 游戏组件三处接入(与 V4.1 完全一致)
 
 ```tsx
-import { withTelemetry, useTrack } from '@/webops/runtime';   // ← 关键:不是 '@/webops'
+import { withTelemetry, useTrack } from '@/webops/runtime';   // ← 注意是 /runtime
+import { create } from 'zustand';
 
 // (1) store 用 withTelemetry 包
 const useGameStore = create<S>()(
-  withTelemetry({ targetId: 'game', enums: { status: { ... } }, skip: [...] })((set, get) => ({ ... }))
+  withTelemetry({
+    targetId: 'game',
+    enums: { status: { playing: 0, gameover: -1, victory: 1 } },
+    skip: ['cards']                                            // 大对象用 skip 避免序列化爆炸
+  })((set, get) => ({ /* normal store */ }))
 );
 
 // (2) 关键 UI 元素加 vt-id
-const acuteBtn = useTrack('btn_acute', { watch: ['opacity'] });
-return <button {...acuteBtn} onClick={...}>...</button>;
+function ClassifyButtons() {
+  const acute = useTrack('btn_acute',  { watch: ['opacity'] });
+  return <button {...acute} onClick={...}>Acute</button>;
+}
 
 // (3) R3F 对象可选挂 userData.signals
-<mesh userData={{ signals: { angle: 45, typeCode: 1 } }} name="card_xyz">...</mesh>
+<mesh
+  name="card_xyz"
+  userData={{ signals: { angle: data.angle, typeCode: ANGLE_CODE[data.type] } }}
+/>
 ```
 
-`@/webops/runtime` 与 `@/webops` 的区别见下面"[生产安全](#生产安全重要)"章节。
+**`window.useGameStore` 暴露**:V5 的 Go builder 通过 `useGameStore.getState()` 访问状态(在 `state_eq` 等谓词内),所以 dev/audit 模式下需要把 store 挂到 window:
+
+```tsx
+if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+  (window as any).useGameStore = useGameStore;
+}
+```
+
+如果用别的 store 名,在 Go builder 的 IR 里改 `store` 字段(默认 `"useGameStore"`)。
 
 ---
 
 ## 端到端流程
 
 ```
-[Go: webops.go]                  [Headless Chrome]              [Next.js 应用]
-                                                                   (已 import @/webops)
-POST /webops/diagnose-batch
-  url, scenarios?, tags?, concurrency
-   │
-   ▼
-chromedp(共享 Browser):
-  describe ─────────────► fresh tab → window.WebOps.describe()
-                              │  返回 { gameIntent, scenarios[] }
-                              ▼
-  fan-out (sem-bounded):
-    tab #1: navigate → window.WebOps.run('perfect-player') → payload₁
-    tab #2: navigate → window.WebOps.run('lazy-player')    → payload₂
-    tab #3: navigate → window.WebOps.run('click-player')   → payload₃
-    [errgroup: 单失败不取消整批,记 InfraError]
-   │
-   ▼ aggregate(gameIntent, [payload₁..N])
-   │
-   ▼ POST → Anthropic (single call, batch system prompt)
-   │
-   ▼ verdict: { perScenario, crossScenarioFindings, rootCauses }
-   │
-返回给调用方
+[Go: coffee_cloze_test.go]                   [Headless Chrome tab]            [Next.js 应用]
+                                                                              (已 import @/webops)
+
+scenarios := buildScenarios()
+  // 5 个 Scenario,每个带 ID/Hypothesis/Intent/Tags/Script
+                                                                                    │
+webops.Audit(ctx, AuditRequest{...})                                                │
+  │                                                                                 │
+  │ ensureBrowser(concurrency)                                                      │
+  │                                                                                 │
+  │ for each scenario (fan-out, sem-bounded):                                       │
+  │   ┌── runOneInline(scenario.Script):                                            │
+  │   │   chromedp.Navigate(url + "?webops=1")  ───────►   Bootstrap                │
+  │   │                                                     ├ shouldEnableWebOps    │
+  │   │                                                     └ await import('@/webops')
+  │   │   chromedp.Poll(window.WebOps.runInline) ◄─────── 挂载 WebOpsAgent           │
+  │   │                                                                              │
+  │   │   evaluate `window.WebOps.runInline({...IR}, {...})`                         │
+  │   │                                       │                                      │
+  │   │                                       ▼  compileIR → CompiledScript          │
+  │   │                                       ▼  runSession(script) → SessionReport  │
+  │   │                                       ▼  buildLLMPayload → LLMPayload        │
+  │   │   ◄────── LLMPayload JSON string ─────┘                                      │
+  │   └── close tab                                                                  │
+  │                                                                                  │
+  └─ aggregate → callLLMBatch (1 次跨场景判决) → AuditResult                          │
+       │                                                                              │
+       ▼  perScenario verdicts + crossScenarioFindings + rootCauses                   │
+                                                                                      │
+打印 verdict / 按 -strict 决定 exit code / 进 -fix loop                                │
 ```
 
 ---
@@ -182,47 +211,40 @@ chromedp(共享 Browser):
 
 **1 次 page navigation = 1 个 scenario,永远**。
 
-理由:游戏状态、AudioContext、R3F scene、zustand store 都是 tab 内全局单例。即使写 reset 也会留 monkey-patched 原型链、监听器残留、R3F canvas 句柄变化等隐患。
+理由:游戏状态、AudioContext、R3F scene、Zustand store 都是 tab 内全局单例。即使写 reset 也会留 monkey-patched 原型链、监听器残留、R3F canvas 句柄变化等隐患。
 
-所以并发只发生在 tab 维度:
+并发只发生在 tab 维度:
 
-- 一个长寿命 Chrome 进程(共享 ExecAllocator)
-- 每个请求开**新 tab**(`chromedp.NewContext(sharedAlloc)`),tab 之间 storage / cookie / window 完全隔离
-- 信号量 `sem` 卡死同时打开的 tab 数(默认 8,可由 `-concurrency` flag 或 `CONCURRENCY` env 改)
-- **tab 数与注册的 scenario 数完全解耦**:8 worker 跑 20 scenario 排两轮多;4 worker 跑 4 scenario 一轮跑完
+- 一个长寿命 Chrome 进程(共享 `ExecAllocator`),首次 `Audit` 时懒启动
+- 每个 scenario 开**新 tab**(`chromedp.NewContext(sharedAlloc)`),tab 之间 storage / cookie / window 完全隔离
+- 信号量 `sem` 卡死同时打开的 tab 数(默认 8,可在 `AuditRequest.Concurrency` 覆盖)
+- **tab 数与 scenario 数完全解耦**:8 worker 跑 20 scenario 排两轮多;4 worker 跑 4 scenario 一轮跑完
 
-TS 侧的 `runSession` 加了 in-flight 锁:同一 tab 内并发调用直接抛异常,而不是数据静默串台。这是防御性设计——正常的 V4 部署模型一个 tab 只跑一次 session。
-
-### Register N 个 ≠ 自动开 N 个 tab
-
-`webops.register('xxx', ...)` 只是往 Map 里加一条,**任何**页面加载(真用户、Go chromedp tab、本地手动 audit)都会跑这段代码。真正"开 tab"的主语只有 Go——`/webops/diagnose-batch` 收到请求后 fan-out N 个 tab,每个 tab navigate 同一个 URL、注册同一批剧本,但只调 `WebOps.run('id')` 跑其中一个。tab 数由 `selected scenarios` 决定,受 `concurrency` 上限约束。
+TS 侧的 `runSession` 加了 in-flight 锁:同一 tab 内并发调用直接抛异常,而不是数据静默串台。这是防御性设计 — 正常的 V5 部署模型一个 tab 只跑一次 session。
 
 ---
 
 ## 生产安全(双入口 + 动态 import)
 
-V4.0 的所有页面加载都会无条件 register。这意味着真用户的 Chrome 里 `window.WebOps` 一直挂着,Script DSL IR 全进了生产 bundle,本就只该出现在 audit 场景的入口被生产用户白白下载几十 KB。
-
-V4.1 用**双入口 + 动态 import**彻底解决:
+V5 沿用 V4.1 的双入口架构,生产用户不下载任何审计代码。
 
 | 入口 | 何时加载 | 内容 | 体积(gzipped) |
 |---|---|---|---|
-| `@/webops/runtime` | 静态,组件 import | useTrack / withTelemetry / shouldEnableWebOps | ~5KB |
-| `@/webops` | 动态,Bootstrap 命中闸门时 await import | webops 单例 + SessionRunner + ReportBuilder + Script DSL + 6 个 core 探针 | ~25-30KB |
+| `@/webops/runtime` | 静态,组件 import | `useTrack` / `withTelemetry` / `shouldEnableWebOps` | ~5KB |
+| `@/webops` | 动态,Bootstrap 命中闸门时 `await import` | `webops` 单例 + IR 编译器 + SessionRunner + ReportBuilder + 6 个 core 探针 | ~25-30KB |
 
 ### 链路
 
 ```
-[Go: chromedp.Navigate(applyAuditParam(url))]
-        ↓ URL = "http://app/games/angle?webops=1"
+[Go: chromedp.Navigate(url + "?webops=1")]
         ↓
-[chromedp tab: 加载页面]
+[chromedp tab 加载页面]
         ↓ Bootstrap 跑 → shouldEnableWebOps() → true
         ↓ await import('@/webops')   ← 此刻才下载审计 chunk
-        ↓ webops.register × N
-        ↓ Go 调 WebOps.describe() / WebOps.run() ✓
+        ↓ window.WebOps.runInline 挂载就绪
+        ↓ Go 调 WebOps.runInline(scriptJSON, metaJSON) ✓
 
-[真用户: 直接访问 http://app/games/angle (无 query)]
+[真用户: 直接访问 url(无 query)]
         ↓ Bootstrap 跑 → shouldEnableWebOps() → false
         ↓ 直接 return,await import 永不发生
         ↓ 审计 chunk 永不下载
@@ -230,239 +252,349 @@ V4.1 用**双入口 + 动态 import**彻底解决:
         ↓ 生产 bundle 只多 useTrack/withTelemetry 的 ~5KB stub(且无副作用)
 ```
 
-### 为什么需要拆 runtime 入口
-
-游戏组件每次 render 都用 `useTrack` / `withTelemetry`,它们必须能**静态** import,不可能走动态。但这两个 hook 在生产环境本就是 stub(没有 push 函数时全部 set / render 走原路,零开销),让它们独立成 `runtime.ts` 文件、不引用 SessionRunner 等重型模块,就能放心进生产 bundle。
-
-如果 hooks 还从 `@/webops` 拿,Next.js 的静态分析会把 agent.ts 整条依赖图(SessionRunner / ReportBuilder / analyzer / 6 探针)都视为组件依赖,塞进生产 bundle,前面的动态 import 努力前功尽弃。
-
 ### 关于 Go 侧
 
-`auditParam = "webops=1"` 在 webops.go 里写死成常量。Go 二进制本身就是审计工具,不存在"非审计"运行模式,flag 形式的开关纯属配置噪音。要换名字(改成更隐蔽的串挡偶然访客,例如 `audit_2025=x9`),修改两个常量:
+`auditParam = "webops=1"` 在 `webops/webops.go` 里写死成常量。要换名字(改成更隐蔽的串挡偶然访客),修改两个常量:
 
 ```
-webops.go      const auditParam = "..."
-runtime.ts     shouldEnableWebOps({ param: '...', value: '...' })
+webops/webops.go     const auditParam = "..."
+runtime.ts           shouldEnableWebOps({ param: '...', value: '...' })
 ```
 
-故意采用"成对源码改动"而不是 flag 配置:这种联动改动用 grep 一眼能审,而 flag 形式容易出现"一边改了一边没改"的悄悄不一致。
+故意采用"成对源码改动"而不是 flag 配置:联动改动用 grep 一眼能审,flag 形式容易出现"一边改了一边没改"的悄悄不一致。
 
 ---
 
-## Script DSL 完整参考
+## Go Script DSL 完整参考
 
 ### 入口
 
-```ts
-import { Script } from '@/webops';
-const script = Script('scenarioId')   // 工厂
-  .strategy('human_like')              // 'human_like' | 'instant'
-  .timeout(120_000)                    // session 硬超时
-  .continueOnExpectFail(true)          // expect 失败是否继续(默认 true)
-  // ...动作链...
-  .build();                            // 返回 CompiledScript
-```
+```go
+import "yourorg/webops-v5/webops"
 
-> **重要**: register 时传的是**工厂函数** `() => script`,不是直接传 `script`。这样每次 run 都重新构造 IR,避免跨 run 共享状态。
+s := webops.Script("scenarioId").
+    Strategy("human_like").              // "human_like" | "instant"
+    Timeout(120_000).                    // session 硬超时(ms)
+    ContinueOnExpectFail(true).          // expect 失败是否继续(默认 true)
+    // ...动作链...
+    Build()                              // 返回 InlineScript
+```
 
 ### 动作类
 
-| 方法 | 用途 | 可选参数 |
-|---|---|---|
-| `.click(target, opts?)` | 单击。target 可以是 vt-id / CSS 选择器 / 绝对坐标 / `{ vtId }` / `{ selector }` | `mark`、`mode: 'pointer'\|'native'`、`intent` |
-| `.drag(from, to, opts?)` | 拖拽,适合 R3F/Rapier 物理交互 | `durationMs`、`mark`、`intent` |
-| `.type(text, opts?)` | 在当前 focus 元素输入文本 | `clearFirst`、`mark`、`intent` |
-| `.key(key, opts?)` | 派发 keydown+keyup,适合 a/s/d 玩法 | `mark`、`intent` |
-| `.mark(name, meta?, intent?)` | 仅打因果标记,不做动作 | meta、intent |
+| 方法 | 用途 | 必填参数 | 可选 Opts |
+|---|---|---|---|
+| `Click(target, opts...)` | 单击 | `Target` | `Mark`, `Mode`, `Intent` |
+| `Drag(from, to, opts...)` | 拖拽,适合 R3F/Rapier 物理交互 | `Target, Target` | `Duration`, `Mark`, `Intent` |
+| `Type(text, opts...)` | 在 focused 元素输入文本 | `string` | `ClearFirst`, `Mark`, `Intent` |
+| `Key(key, opts...)` | 派发 keydown+keyup,适合 a/s/d 玩法 | `string` | `Mark`, `Intent` |
+| `MarkOnly(name, opts...)` | 仅打因果标记,不做动作 | `string` | `WithMeta`, `Intent` |
 
-**`mark` vs `intent` 的区分**:
-- `mark` 是给 analyzer 用的**结构性标签**(必须稳定),用来配对计算 interval verdict 与 audio sync。
-- `intent` 是给 LLM 看的**自然语言注解**("这一步在做什么、期望什么反应")。analyzer 不消费它。
+`Target` 由三个构造器之一产生:
+
+```go
+webops.Vt("btn_acute")          // [data-vt-id="btn_acute"]
+webops.Sel(".my-css-class")     // 任意 CSS 选择器
+webops.XY(100, 200)             // 绝对坐标
+```
+
+**`Mark` vs `Intent` 的区分**(与 V4.1 一致):
+- `Mark` 是给 analyzer 用的**结构性标签**(必须稳定),用来配对计算 interval verdict 与 audio sync
+- `Intent` 是给 LLM 看的**自然语言注解**("这一步在做什么、期望什么反应"),analyzer 不消费它
 
 二者并存。例:
-```ts
-.key('a', {
-  mark: 'CLICK_ACUTE_CORRECT',                         // 给 analyzer
-  intent: '焦点是锐角,按 a 应被判正确并 +100 分'         // 给 LLM
-})
+```go
+s.Key("a",
+    webops.Mark("CLICK_ACUTE_CORRECT"),                    // 给 analyzer
+    webops.Intent("焦点是锐角,按 a 应被判正确并 +100 分"))  // 给 LLM
 ```
 
 ### 等待类
 
-```ts
-.wait(2000, 'wait_for_first_spawn')          // 固定等
-.waitFor('focus_set',                         // 轮询等
-  () => useGameStore.getState().focusedAngleCode > 0,
-  4000                                        // 超时 ms
-)
+```go
+s.Wait(2000, "wait_for_first_spawn")              // 固定等;label 进入 ActionRecord.name
+s.WaitFor("focus_set",                            // 轮询等
+    webops.StateGt("focusedAngleCode", 0),
+    4000)                                          // 超时 ms
 ```
 
-### 观测/读取/断言
+### 观测 / 读取 / 断言
 
-```ts
-.observe('first_card_appeared',               // 软观测,失败不中止
-  () => useGameStore.getState().cards.length > 0)
+```go
+s.Observe("first_card_appeared",                   // 软观测,失败不中止
+    webops.StateLenGt("cards", 0))
 
-.read('current_score',                        // 读值,后续 branch/dispatch 可拿
-  () => useGameStore.getState().score)
+s.Read("current_score",                            // 读值,后续 Branch/Dispatch 可拿
+    webops.StateGet("score"))
 
-.expect('victory_reached',                    // 硬断言,失败按 continueOnExpectFail 决定
-  () => useGameStore.getState().status === 'victory')
+s.Expect("victory_reached",                        // 硬断言,失败按 ContinueOnExpectFail 决定
+    webops.StateEq("status", "victory"))
 ```
 
 ### 控制流
 
-#### branch(底层)
+#### Branch(底层)
 
-```ts
-.branch(
-  (read) => read('angle_type') === 1,
-  (b) => b.key('a', { mark: 'CLICK_ACUTE' }),
-  (b) => b.key('s', { mark: 'CLICK_OTHER' })   // 可选 else 分支
+```go
+s.Branch(
+    webops.ReadEq("angle_type", 1),
+    func(b *webops.B) { b.Key("a", webops.Mark("CLICK_ACUTE")) },
+    func(b *webops.B) { b.Key("s", webops.Mark("CLICK_OTHER")) },  // 可传 nil
 )
 ```
 
-#### dispatch(高层 macro,推荐)
+#### Dispatch(高层 macro,推荐)
 
-读一个值 → 按值走对应分支。等价于 `.read(name, reader).branch(...).branch(...)`,但一次写完:
+读一个值 → 按值走对应分支。等价于 `Read + N*Branch`,但一次写完:
 
-```ts
-.dispatch(
-  () => useGameStore.getState().focusedAngleCode,
-  {
-    1: (b) => b.key('a', { mark: 'CLICK_ACUTE',  intent: '焦点是锐角' }),
-    2: (b) => b.key('s', { mark: 'CLICK_RIGHT',  intent: '焦点是直角' }),
-    3: (b) => b.key('d', { mark: 'CLICK_OBTUSE', intent: '焦点是钝角' }),
-  },
-  { name: 'angle_type' }    // 可选,默认 _dispatch_<index>
-)
+```go
+s.Dispatch("angle_type",
+    webops.StateGet("focusedAngleCode"),
+    webops.Cases{
+        "1": func(b *webops.B) { b.Key("a", webops.Mark("CLICK_ACUTE"),  webops.Intent("焦点是锐角")) },
+        "2": func(b *webops.B) { b.Key("s", webops.Mark("CLICK_RIGHT"),  webops.Intent("焦点是直角")) },
+        "3": func(b *webops.B) { b.Key("d", webops.Mark("CLICK_OBTUSE"), webops.Intent("焦点是钝角")) },
+    })
 ```
 
-cases 的 key 是字符串,但 reader 返回 number 也 OK——内部用 `String()` 强制转换两端比较。不在 cases 里的值会"什么都不做"继续往下。
+cases 的 key 是字符串。`read_eq` 内部用 `String()` 强制转换两端比较,reader 返回 number(如 `focusedAngleCode = 1`)也能匹配 `"1"`。不在 cases 里的值会"什么都不做"继续往下。
 
-#### loop
+Builder 在添加 Dispatch 时**会对 cases keys 排序**再 desugar,确保 IR 输出确定性(便于 diff / hash / 缓存)。
 
-```ts
-.loop(20, (s) =>
-  s.waitFor('next_card', () => ..., 4000)
-   .dispatch(() => ..., { ... })
-   .wait(900)
-)
+#### Loop
+
+```go
+s.Loop(20, func(s *webops.B) {
+    s.WaitFor("next_card", webops.StateGt("focusedAngleCode", 0), 4000)
+    s.Dispatch(...)
+    s.Wait(900, "")
+})
 ```
+
+### 步骤选项(`Opt`)
+
+通过函数式 options 提供。每个 Opt 都是 `func(Step)`,叠加修改 Step map。
+
+| Opt | 适用动作 | 作用 |
+|---|---|---|
+| `Mark(name)` | Click/Drag/Type/Key/MarkOnly/WaitFor | 打 analyzer 用的结构标签 |
+| `Intent(text)` | 所有动作 | LLM 看的自然语言注解 |
+| `Mode("native")` | Click | 跳过 PointerEvent 直接 `.click()` |
+| `Duration(ms)` | Drag | 拖拽时长(默认 500ms) |
+| `ClearFirst(true)` | Type | 输入前清空 |
+| `WithMeta(map)` | MarkOnly/任何 | 给 marker 附 metadata |
+
+---
+
+## Predicate 词汇表
+
+谓词描述"返回 boolean 的事实判定"。所有 `Observe` / `Expect` / `WaitFor` / `Branch` 的 check 字段都接收一个 `Predicate`。
+
+`state_*` 系列读 `window[storeName].getState()`(默认 `useGameStore`),path 是点分路径(如 `"phase"`、`"cards.length"`)。
+
+| 构造器 | 翻译为 | 用例 |
+|---|---|---|
+| `StateEq(path, value)` | `state.path === value` | `StateEq("phase", "COMPLETE")` |
+| `StateNe(path, value)` | `state.path !== value` | `StateNe("currentTarget", "none")` |
+| `StateGt(path, v)` | `state.path > v` | `StateGt("score", 0)` |
+| `StateGe(path, v)` | `state.path >= v` | `StateGe("score", 600)` |
+| `StateLt(path, v)` | `state.path < v` | `StateLt("score", 700)` |
+| `StateLe(path, v)` | `state.path <= v` | `StateLe("score", 400)` |
+| `StateIn(path, v...)` | `[...vs].includes(state.path)` | `StateIn("phase", "CORRECT", "INCORRECT")` |
+| `StateTruthy(path)` | `!!state.path` | `StateTruthy("isReady")` |
+| `StateLenEq(path, n)` | `Array.isArray && length === n` | `StateLenEq("reviewQueue", 0)` |
+| `StateLenGt(path, n)` | `Array.isArray && length > n` | `StateLenGt("cards", 0)` |
+| `StateCountEq(path, key, eq, n)` | `arr.filter(x => x[key]===eq).length === n` | `StateCountEq("attempts", "errorType", "position", 4)` |
+| `StateEveryEq(path, key, eq)` | `arr.every(x => x[key] === eq)` | `StateEveryEq("attempts", "hintUsed", true)` |
+| `DOMExists(sel)` | `!!document.querySelector(...)` | `DOMExists("game-root")` (vt-id 简写) |
+| `DOMMissing(sel)` | `!document.querySelector(...)` | `DOMMissing("loading-overlay")` |
+| `All(p...)` | `preds.every(...)` | `All(StateEq("phase", "CHOOSING"), StateNe("currentTarget", "none"))` |
+| `Any(p...)` | `preds.some(...)` | `Any(StateEq("phase", "CORRECT"), StateEq("phase", "INCORRECT"))` |
+| `Not(p)` | `!pred` | `Not(DOMExists("error-modal"))` |
+| `ReadEq(name, value)` | `String(read(name)) === String(value)` | `ReadEq("idx", 0)` (仅 Branch 内有效) |
+| `ReadModEq(name, mod, v)` | `(Number(read(name)) % mod) === v` | `ReadModEq("idx", 2, 0)` (偶数判定) |
+| `ExprP(code)` | `!!new Function('store','read', 'return '+code)(state, read)` | `ExprP("store.attempts.length > 0 && store.attempts[store.attempts.length-1].hintUsed === true")` |
+
+**DOM 选择器约定**:`DOMExists("foo")` 不以 `[` / `.` / `#` 开头时,自动展开为 `[data-vt-id="foo"]`。要用原生 CSS 选择器,显式写完整形式:`DOMExists(".my-class")`。
+
+**Read 系谓词**:`ReadEq` 与 `ReadModEq` 引用 `Read` 步骤的产物。注意它们**只有在 `Branch` 的 when 子句里**有意义 — SessionRunner 只在 branch.predicate 注入 `ReadFn`;其他位置(Observe/Expect/WaitFor)的 reader 永远返回 undefined。
+
+**`ExprP` 是最后的逃生口**:当上面这些组合不够用,直接写 JS 表达式。作用域里有 `store`(整个 state)和 `read`(ReadFn)。`store` 已经是 `.getState()` 后的快照。一行能写清就用 ExprP,涉及超过两行的复杂逻辑应该考虑往 store 里加一个 derived selector,而不是把逻辑塞 Expr。
+
+---
+
+## ValueSource 词汇表
+
+值源描述"返回任意值"。`Read` 步骤和 `Dispatch` 的 source 字段接收一个 `ValueSource`。
+
+| 构造器 | 翻译为 | 用例 |
+|---|---|---|
+| `StateGet(path)` | `getPath(state, path)` | `StateGet("currentTarget")` |
+| `StateLen(path)` | `Array.isArray(v) ? v.length : 0` | `StateLen("reviewQueue")` |
+| `StateCount(path, key, eq)` | `arr.filter(x => x[key]===eq).length` | `StateCount("attempts", "errorType", "position")` |
+| `StateMap(path, key)` | `arr.map(x => x[key])` | `StateMap("attempts", "errorType")` |
+| `ExprV(code)` | 同 ExprP 但返回 any 值 | `ExprV("Object.keys(store.cards).length")` |
 
 ---
 
 ## 意图三层结构
 
-V4.1 的核心改进是把"意图"明确分到三个层次,服务三个不同消费者:
+V5 沿用 V4.1 的"意图三层"划分,服务三个不同消费者:
 
 | 层级 | 字段 | 谁产生 | 谁消费 | 何时记录 |
 |---|---|---|---|---|
-| Game-level | `gameIntent` | `webops.setGameIntent('...')` 一次 | LLM 跨场景判决 | 注册阶段 |
-| Scenario-level | `intent` + `hypothesis` | `webops.register('id', { intent, hypothesis })` | LLM 单/跨场景判决 | 注册阶段 |
-| Action-level | `intent` 在 step opts 里 | `.click(t, { intent: '...' })` | LLM 看 timeline | 编译阶段 |
-| Action-level (analyzer) | `mark` | `.click(t, { mark: '...' })` | analyzer 算 interval | 运行阶段 |
+| Game-level | `gameIntent` | `AuditRequest.GameIntent` | LLM 跨场景判决 | 每次 Audit |
+| Scenario-level | `Scenario.Intent` + `Scenario.Hypothesis` | 测试作者写 | LLM 单/跨场景判决 | builder 里 |
+| Action-level (intent) | `Intent(...)` step opt | 测试作者写 | LLM 看 timeline | builder 里 |
+| Action-level (mark) | `Mark(...)` step opt | 测试作者写 | analyzer 算 interval | builder 里 |
 
-`intent` 全部 optional,先跑通再回填。强制必填会变成形式主义负担("intent: click button" 这种废话注解反而稀释信号)。
+`Intent` 全部 optional,先跑通再回填。强制必填会变成形式主义负担("intent: click button" 这种废话注解反而稀释信号)。
 
-`hypothesis` vs `intent` 的区分:
-- **hypothesis** 偏"断言":"按对键应当 +100 分,score ≥ 1500 时进 victory"——可以被验证真假。
-- **intent** 偏"目的":"验证按键-分类的因果链路"——说明你在审计什么。
+`Hypothesis` vs `Intent` 的区分:
+- **Hypothesis** 偏"断言":"按对键应当 +100 分,score ≥ 1500 时进 victory" — 可以被验证真假
+- **Intent** 偏"目的":"验证按键-分类的因果链路" — 说明你在审计什么
 
-二者互补:LLM 看 hypothesis 知道你期待看到什么具体行为,看 intent 知道你这次测试在审计哪个设计目标。
+二者互补:LLM 看 hypothesis 知道你期待什么具体行为,看 intent 知道你这次测试在审计哪个设计目标。
 
 ---
 
 ## 完整剧本范例
 
-### Happy path:perfectPlayer(用 dispatch)
+### Happy path:perfect-player
 
-```ts
-import { Script } from '@/webops';
-declare const useGameStore: any;
-
-export const perfectPlayer = () =>
-  Script('perfect_classify_20_cards')
-    .strategy('human_like')
-    .timeout(120_000)
-    .wait(1500, 'wait_for_first_spawn')
-    .observe('first_card_appeared', () => useGameStore.getState().cards.length > 0)
-    .loop(20, (s) =>
-      s
-        .waitFor('next_card_focused', () => useGameStore.getState().focusedAngleCode > 0, 4000)
-        .dispatch(
-          () => useGameStore.getState().focusedAngleCode,
-          {
-            1: (b) => b.key('a', { mark: 'CLICK_ACUTE_CORRECT',  intent: '焦点锐角,按 a 应得分' }),
-            2: (b) => b.key('s', { mark: 'CLICK_RIGHT_CORRECT',  intent: '焦点直角,按 s 应得分' }),
-            3: (b) => b.key('d', { mark: 'CLICK_OBTUSE_CORRECT', intent: '焦点钝角,按 d 应得分' }),
-          }
-        )
-        .wait(900, 'wait_card_animation')
-    )
-    .wait(2000, 'wait_for_victory')
-    .read('final_score',  () => useGameStore.getState().score)
-    .read('final_status', () => useGameStore.getState().status)
-    .expect('victory_reached',     () => useGameStore.getState().status === 'victory')
-    .expect('score_at_least_1500', () => useGameStore.getState().score >= 1500)
-    .build();
+```go
+func buildPerfectPlayer() webops.Scenario {
+    return webops.Scenario{
+        ID:         "perfect-player",
+        Tags:       []string{"happy-path"},
+        Intent:     "验证按 currentTarget 正确拖放的 happy path",
+        Hypothesis: "每次正确拖 → +100 或 +200,无 reviewQueue 入队,6 题后 phase=COMPLETE 且 correctCount=6",
+        Script: webops.Script("perfect_all_correct").
+            Strategy("human_like").
+            Timeout(180_000).
+            ContinueOnExpectFail(true).
+            Wait(800, "wait_for_first_render").
+            Observe("game_root_visible", webops.DOMExists("game-root")).
+            Loop(6, func(s *webops.B) {
+                s.WaitFor("item_ready",
+                    webops.All(
+                        webops.StateEq("phase", "CHOOSING"),
+                        webops.StateNe("currentTarget", "none"),
+                    ), 5000)
+                s.Read("target", webops.StateGet("currentTarget"))
+                s.Dispatch("lex", webops.StateGet("currentTarget"), webops.Cases{
+                    "cup": func(b *webops.B) {
+                        b.Drag(webops.Vt("word-card-cup"), webops.Vt("zone-cup-hitarea"),
+                            webops.Duration(500),
+                            webops.Mark("DRAG_CORRECT_CUP"),
+                            webops.Intent("拖 cup 到 cup zone — scene cloze 应判正确并触发庆祝层"))
+                    },
+                    // saucer / hot / liquid / beverage / coffee...
+                })
+                s.WaitFor("feedback_shown",
+                    webops.Any(
+                        webops.StateEq("phase", "CORRECT"),
+                        webops.StateEq("phase", "INCORRECT"),
+                    ), 3000)
+                s.Observe("feedback_is_correct", webops.StateEq("lastFeedbackKind", "correct"))
+                s.Wait(700, "wait_celebration")
+                s.Click(webops.Vt("next-button"), webops.Mark("CLICK_NEXT"), webops.Intent("进入下一题"))
+                s.Wait(400, "")
+            }).
+            Wait(1500, "wait_complete_screen").
+            Read("final_score", webops.StateGet("score")).
+            Expect("reached_complete",   webops.StateEq("phase", "COMPLETE")).
+            Expect("all_6_attempts",     webops.StateEq("attemptsCount", 6)).
+            Expect("all_correct",        webops.StateEq("correctCount", 6)).
+            Expect("score_at_least_600", webops.StateGe("score", 600)).
+            Expect("review_queue_empty", webops.StateLenEq("reviewQueue", 0)).
+            Build(),
+    }
+}
 ```
 
-### Failure path:lazyPlayer
+### Failure path:semantic-error-player
 
-```ts
-export const lazyPlayer = () =>
-  Script('lazy_always_acute')
-    .strategy('instant')
-    .timeout(60_000)
-    .wait(1500)
-    .loop(15, (s) =>
-      s
-        .waitFor('card_appears', () => useGameStore.getState().cards.length > 0, 4000)
-        .key('a', {
-          mark: 'PRESS_A',
-          intent: '盲按 a:right/obtuse 卡应判错扣 lives,acute 卡应得分'
-        })
-        .wait(800)
-    )
-    .read('end_status', () => useGameStore.getState().status)
-    .read('end_lives',  () => useGameStore.getState().lives)
-    .expect('eventually_gameover', () => useGameStore.getState().status === 'gameover')
-    .build();
+```go
+func buildSemanticErrorPlayer() webops.Scenario {
+    return webops.Scenario{
+        ID:         "semantic-error-player",
+        Tags:       []string{"failure-path", "semantic-error"},
+        Intent:     "验证 classifyError 的 lex !== target 分支与 reviewQueue 完整入队",
+        Hypothesis: "6 题全 errorType='semantic',correctCount=0,score=0,reviewQueue 6 项",
+        Script: webops.Script("semantic_error_wrong_words").
+            Strategy("human_like").
+            Timeout(150_000).
+            Wait(800, "").
+            Loop(6, func(s *webops.B) {
+                s.WaitFor("item_ready",
+                    webops.All(
+                        webops.StateEq("phase", "CHOOSING"),
+                        webops.StateNe("currentTarget", "none"),
+                    ), 5000)
+                s.Dispatch("lex", webops.StateGet("currentTarget"), webops.Cases{
+                    "cup": func(b *webops.B) {
+                        b.Drag(webops.Vt("word-card-liquid"), webops.Vt("zone-cup-hitarea"),
+                            webops.Mark("SEM_ERR_Q1"),
+                            webops.Intent("q1 (cup) 实拖 liquid — choices 含 liquid,应判 semantic"))
+                    },
+                    // ...其它 5 个故意错答
+                })
+                s.WaitFor("feedback_shown",
+                    webops.Any(webops.StateEq("phase", "CORRECT"), webops.StateEq("phase", "INCORRECT")), 3000)
+                s.Observe("feedback_is_semantic", webops.StateEq("lastFeedbackKind", "semantic"))
+                s.Wait(500, "")
+                s.Click(webops.Vt("next-button"), webops.Mark("NEXT"))
+                s.Wait(400, "")
+            }).
+            Wait(1500, "").
+            Expect("reached_complete",     webops.StateEq("phase", "COMPLETE")).
+            Expect("all_6_semantic",       webops.StateEveryEq("attempts", "errorType", "semantic")).
+            Expect("zero_correct",         webops.StateEq("correctCount", 0)).
+            Expect("zero_score",           webops.StateEq("score", 0)).
+            Expect("review_queue_full_6",  webops.StateLenEq("reviewQueue", 6)).
+            Build(),
+    }
+}
 ```
 
-完整三个剧本(perfect / lazy / click)见 `examples--angle-sorting--scripts.ts`。
+完整 5 个剧本(perfect / position-error / semantic-error / hint / mixed)见 `coffee_cloze_test.go`。
 
 ---
 
-## 组件接入
+## 组件接入(TypeScript 侧不变)
 
-只有三处需要动业务代码,加起来不到 30 行。
+V5 一行没动 React hook、Zustand 中间件、R3F 桥接。下面摘录与 V4.1 完全一致。
 
-### (1) Zustand store:withTelemetry 包一层
+### (1) Zustand store:`withTelemetry` 包一层
 
 ```tsx
 import { create } from 'zustand';
-import { withTelemetry } from '@/webops';
+import { withTelemetry } from '@/webops/runtime';
 
 const useGameStore = create<S>()(
   withTelemetry({
     targetId: 'game',
-    enums: { status: { playing: 0, gameover: -1, victory: 1 } },  // 字符串枚举映射成数字
-    skip: ['cards']                                                 // 大对象用 skip 避免序列化爆炸
+    enums: { status: { playing: 0, gameover: -1, victory: 1 } },
+    skip: ['cards']
   })((set, get) => ({
     score: 0, lives: 3, status: 'playing', cards: [],
     // 业务方法...
   }))
 );
+
+// V5 关键:让 Go 端 Script DSL 能访问到 store
+if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+  (window as any).useGameStore = useGameStore;
+}
 ```
 
-`withTelemetry` 自动把数值字段(score/lives)推到 VirtualChannel,枚举字段用 `enums` 映射。`skip` 列表里的字段不推(适合大数组/对象)。
+`withTelemetry` 自动把数值字段(`score`/`lives`)推到 VirtualChannel,枚举字段用 `enums` 映射。`skip` 列表里的字段不推(适合大数组/对象)。
 
-### (2) UI 元素:useTrack 拿 vt-id
+### (2) UI 元素:`useTrack` 拿 vt-id
 
 ```tsx
-import { useTrack } from '@/webops';
+import { useTrack } from '@/webops/runtime';
 
 function ClassifyButtons() {
   const acute = useTrack('btn_acute',  { watch: ['opacity'] });
@@ -478,9 +610,9 @@ function ClassifyButtons() {
 }
 ```
 
-`watch` 让 DOM K 线追踪指定 CSS 属性(rotation / scale / opacity / width / height)。脚本里 `.click('btn_acute')` 就用这个 vt-id 定位。
+`watch` 让 DOM K 线追踪指定 CSS 属性(`rotation`/`scale`/`opacity`/`width`/`height`)。Go 脚本里 `webops.Vt("btn_acute")` 就用这个 vt-id 定位。
 
-### (3) R3F 对象(可选):userData.signals
+### (3) R3F 对象(可选):`userData.signals`
 
 ```tsx
 <mesh
@@ -491,99 +623,97 @@ function ClassifyButtons() {
 </mesh>
 ```
 
-R3FBridge 每帧采样,把 `userData.signals` 里的数值字段汇入 VirtualChannel,并把世界坐标 project 到屏幕坐标作为 sx/sy/sz K 线。`name` 不能为空、不能是 'Scene'/'Object_*'/含 'Camera'/'Light'(系统节点会被过滤)。
+R3FBridge 每帧采样,把 `userData.signals` 里的数值字段汇入 VirtualChannel,并把世界坐标 project 到屏幕坐标作为 `sx`/`sy`/`sz` K 线。`name` 不能为空、不能是 `Scene`/`Object_*`/含 `Camera`/`Light`(系统节点会被过滤)。
 
 ---
 
-## Go 后端使用
+## Go 库 API
 
-### 启动
+### 核心入口
 
-```bash
-go mod init yourorg/webops
-go get github.com/chromedp/chromedp golang.org/x/sync/errgroup
-ANTHROPIC_API_KEY=sk-ant-... go run webops.go
+```go
+import "yourorg/webops-v5/webops"
 
-# 可选:
-go run webops.go -concurrency=4 -addr=:9000 -model=claude-opus-4-7
-# 或用环境变量 CONCURRENCY / ADDR / LLM_MODEL
+result, err := webops.Audit(ctx, webops.AuditRequest{
+    URL:         "http://localhost:3000/games/coffee-cloze",
+    GameIntent:  "Coffee Cloze: 6 道拖放式 vocabulary cloze 题...",
+    Scenarios:   buildScenarios(),                              // []webops.Scenario
+    Concurrency: 4,                                              // 0 → 默认 8
+    SkipLLM:     false,                                          // true 时只跑不评
+    LLMAPIKey:   "",                                             // "" → 读 ANTHROPIC_API_KEY env
+    LLMModel:    "",                                             // "" → "claude-opus-4-7"
+})
 ```
 
-### 端点
+### 数据类型
 
-#### `GET /webops/describe?url=...`
+```go
+type Scenario struct {
+    ID         string
+    Hypothesis string
+    Intent     string
+    Tags       []string
+    Script     InlineScript    // 由 webops.Script(...).Build() 产出
+}
 
-```bash
-curl 'http://localhost:8080/webops/describe?url=http://localhost:3000/games/angle'
-```
+type ScenarioResult struct {
+    ScenarioID string          `json:"scenarioId"`
+    Hypothesis string          `json:"hypothesis"`
+    Intent     string          `json:"intent,omitempty"`
+    Tags       []string        `json:"tags,omitempty"`
+    Payload    json.RawMessage `json:"payload,omitempty"`       // LLMPayload JSON
+    InfraError string          `json:"infraError,omitempty"`    // 非空 = 该 scenario 网络/超时挂了
+    DurationMs int64           `json:"durationMs"`
+}
 
-返回 `{ description: { gameIntent, scenarios: [{ id, hypothesis, intent, tags }] } }`。
-后台面板用这个端点列出可跑的 scenario。
-
-#### `POST /webops/diagnose`(单 scenario)
-
-```bash
-curl -X POST http://localhost:8080/webops/diagnose \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "url": "http://localhost:3000/games/angle",
-    "scenarioId": "perfect-player",
-    "skipLLM": false
-  }'
-```
-
-返回:
-```json
-{
-  "ok": true,
-  "payload": { /* 前端 LLMPayload 原文 */ },
-  "verdict": "{ \"verdict\": \"PASS\", \"score\": 92, ... }",
-  "durationMs": 8421
+type AuditResult struct {
+    GameIntent string
+    Results    []ScenarioResult
+    Verdict    string    // 原始 LLM JSON 字符串(需要 json.Unmarshal 二次解析)
+    LLMError   string    // 非空 = LLM 调用失败
+    LLMSkipped string    // 非空 = LLM 被跳过(SkipLLM 或无 API key)
+    DurationMs int64
 }
 ```
 
-注意 `verdict` 是 LLM 输出的字符串(里面通常是 JSON),需要调用方再 `JSON.parse` 一次。这是"Go 不持有任何业务数据类型"原则的取舍。
+### 生命周期
 
-#### `POST /webops/diagnose-batch`(多 scenario,推荐)
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+defer cancel()
+defer webops.Close()                  // 关闭共享 chromedp 进程
 
-```bash
-curl -X POST http://localhost:8080/webops/diagnose-batch \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "url": "http://localhost:3000/games/angle",
-    "scenarios": null,
-    "tags": ["happy-path", "failure-path"],
-    "concurrency": 4
-  }'
-```
+result, err := webops.Audit(ctx, req)
+if err != nil { /* fatal — 一般是参数错或全部 navigate 挂了 */ }
 
-参数:
-- `scenarios`: 显式 ID 列表,`null` 或缺省 = 跑 describe 列表里的全部
-- `tags`: 按 tag 过滤(与 scenarios 取并集后再过滤)
-- `concurrency`: 本次请求的并发上限,**不会超过**进程级 `-concurrency`
-- `skipLLM`: true 则只跑不评
+// 单 scenario 失败不导致 err != nil,而是在 result.Results[i].InfraError 里
+for _, r := range result.Results {
+    if r.InfraError != "" { /* 这个 scenario 没跑通 */ }
+}
 
-返回:
-```json
-{
-  "ok": true,
-  "gameIntent": "...",
-  "results": [
-    { "scenarioId": "perfect-player", "hypothesis": "...", "intent": "...",
-      "tags": ["happy-path"], "payload": { ... }, "durationMs": 7200 },
-    { "scenarioId": "lazy-player",    "hypothesis": "...", "infraError": "navigate timeout",
-      "durationMs": 25000 }
-  ],
-  "verdict": "{ \"perScenario\": [...], \"crossScenarioFindings\": [...], \"rootCauses\": [...] }",
-  "durationMs": 18430
+// 解析 LLM verdict (LLM 输出是 JSON 字符串)
+var bv batchVerdict
+if result.Verdict != "" {
+    json.Unmarshal([]byte(stripCodeFence(result.Verdict)), &bv)
 }
 ```
 
-单个 scenario 失败(网络、chromedp 超时等)不取消整批,记 `infraError` 让 LLM 看到"哪些没跑通"——这本身也是诊断信号。
+### 调优常量
+
+包级变量,需要时在程序启动早期改:
+
+```go
+webops.DefaultConcurrency = 4             // 默认 8
+webops.DefaultLLMModel    = "claude-opus-4-7"
+webops.NavTimeout         = 25 * time.Second
+webops.RunTimeout         = 180 * time.Second
+```
 
 ---
 
 ## LLMPayload 结构
+
+LLMPayload 是给大模型看的"事实 + verdict"双层结构,由 TS 侧的 `buildLLMPayload` 产出,Go 透传不解析。
 
 ```ts
 interface LLMPayload {
@@ -596,132 +726,152 @@ interface LLMPayload {
     aborted: boolean;
     framesTruncated?: boolean;     // frame buffer 超 maxFrames 时被丢中段
   };
-  hypothesis?: string;              // 来自 register 时的 hypothesis
-  intent?: string;                  // 来自 register 时的 intent
-  tags?: string[];                  // 来自 register 时的 tags
+  hypothesis?: string;              // 来自 Scenario.Hypothesis(透传)
+  intent?: string;                  // 来自 Scenario.Intent
+  tags?: string[];                  // 来自 Scenario.Tags
   facts: {
     timeline: Array<{               // 按时间排序的动作/marker/observe/expect 流
       t: number;                    // 相对开始 ms
       type: string;                 // step kind / marker / observe / expect
       name: string;
       ok?: boolean;
-      intent?: string;              // ← 来自 step.intent,LLM 看这里就知道动作目的
+      intent?: string;              // ← 来自 step.Intent(...) opt,LLM 看这里就知道动作目的
       detail?: string;
     }>;
-    state: Record<string, any>;     // .read() 收集的最终值
+    state: Record<string, any>;     // 全部 .Read() 收集的最终值
     tracks: Array<{                 // 按 activity 排序的 top N 信号轨道
       key: string;
-      overall: string;              // O=... H=... L=... C=... 摘要
-      windows: { around, pre, post, delta }[];  // 动作前后的局部 K 线
+      overall: string;              // K 线人类摘要 "O=.. H=.. L=.. C=.."
+      windows: Array<{ around: string; pre: string; post: string; delta: number }>;
       totalActivity: number;
     }>;
   };
   verdict: {
-    intervalScore: number;          // 相邻 marker 间是否 HEALTHY
-    expectScore: number;            // expect() 通过率
-    audioScore: number;             // 动作后 600ms 是否有 audio peak
-    overallScore: number;
-    intervals: { range, durationMs, verdict, correlation }[];
-    audioSyncs: { action, latencyMs, verdict }[];
+    intervalScore: number;          // 0-100,基于 interval 裁决
+    expectScore: number;            // 0-100,基于 expect 通过率
+    audioScore: number;             // 0-100,基于音画同步
+    overallScore: number;           // 三者均值
+    intervals: Array<{ range: string; durationMs: number; verdict: string; correlation: number }>;
+    audioSyncs: Array<{ action: string; latencyMs: number; verdict: string }>;
     alerts: string[];
   };
 }
 ```
 
-`overallScore = (intervalScore + expectScore + audioScore) / 3`。
-LLM 拿到这三项 + K 线轨迹 + 行为时间线 + 三层 intent 后,给出最终 PASS/PARTIAL/FAIL 判决。
-
-### Frame buffer 上限
-
-SessionRunner 默认 `maxFrames=800`(可由 `RunnerOptions.maxFrames` 覆盖)。超过时丢中段保两端(60%/40%),`meta.framesTruncated=true` 让 LLM 知道信号不完整。这避免了长跑 session 让 LLMPayload 爆炸。
-
----
-
-## 跨场景判决:单次 LLM 聚合
-
-`/webops/diagnose-batch` 不是"N 个 scenario 调 N 次 LLM 再做汇总"——而是把所有 payload 一次丢给 LLM,让它在统一上下文里做跨场景根因分析。
-
-聚合 prompt 大致结构(见 webops.go `callLLMBatch`):
-
-```
-# GAME DESIGN INTENT
-{gameIntent}
-
-# SCENARIOS IN THIS BATCH
-- perfect-player
-    intent:     验证按键-分类的因果链路实现正确
-    hypothesis: 每次正确按键 → +100 分...
-    tags:       [happy-path]
-- lazy-player
-    intent:     验证错误反馈与 gameover 终止逻辑
-    ...
-
-# PAYLOADS (one per scenario)
-## scenario: perfect-player
-```json
-{ ... LLMPayload 原文 ... }
-```
-## scenario: lazy-player
-...
-
-Now output your JSON judgment.
-```
-
-LLM 输出 strict JSON,关键字段:
+LLM 的 batch system prompt 要求它产出:
 
 ```json
 {
-  "perScenario": [{ "scenarioId", "verdict", "score", "evidence" }, ...],
-  "crossScenarioFindings": [{ "pattern", "scenariosAffected", "evidence" }, ...],
-  "rootCauses": [{
-    "issue": "...",
-    "suggestedFix": {
-      "target": "code" | "script" | "both",
-      "file":   "Angle_SortingChaos.tsx | scripts.ts | ...",
-      "change": "..."
-    }
-  }],
+  "perScenario": [{"scenarioId": "...", "verdict": "PASS|PARTIAL|FAIL|INFRA_FAIL", "score": 0..100, "evidence": [...]}],
+  "crossScenarioFindings": [{"pattern": "...", "scenariosAffected": [...], "evidence": "..."}],
+  "rootCauses": [{"issue": "...", "suggestedFix": {"target": "code|script|both", "file": "...", "change": "..."}}],
   "notes": "..."
 }
 ```
 
-`suggestedFix.target` 强制 LLM 声明本次建议改的是源码、脚本还是两者——同一症状可能两种解读(游戏逻辑错 vs 脚本期待错),不让 LLM 模糊带过。
+---
+
+## V4.1 → V5 迁移指南
+
+### 删除
+
+- **整个 `webops.go`(原 HTTP 服务)**:功能搬入 `webops/webops.go` 库
+- **所有 `examples--*--scripts.ts`**:剧本搬到 Go 文件
+- **TS 端 `agent.ts` 里的 registry / register / describe / setGameIntent**:V5 不再需要
+
+### 新增
+
+- **`script--ir.ts`(TS)**:JSON-safe IR + `compileIR()`
+- **`webops/webops.go`(Go 包)**:IR + builder + chromedp 编排 + LLM batch
+- **每个项目自己的 `*_test.go`**:用 builder 拼脚本(模板见 `coffee_cloze_test.go`)
+
+### 修改
+
+- **`agent.ts`**:从 ~130 行降到 ~30 行,只剩 `runInline(scriptJSON, metaJSON)`
+- **`script--Script.ts`**:删 `ScriptBuilder` 类和 `Script` 工厂,只留类型定义
+- **`index.ts`**:删 `Script` re-export
+- **Bootstrap.tsx**:`webops.register(...)` 全删,留 `import('@/webops')` 一行
+- **store 文件**:增加 `if (!production) (window as any).useGameStore = useGameStore;`(让 Go 端谓词能读 state)
+
+### 不动
+
+- `runtime.ts`、`react--*`、`core--*`、`script--actions.ts`、`session--SessionRunner.ts`、`report--*`
+
+### Bootstrap 改动 diff
+
+```diff
+ 'use client';
+ import { useEffect } from 'react';
+ import { shouldEnableWebOps } from '@/webops/runtime';
+
+ export function WebOpsBootstrap() {
+   useEffect(() => {
+     if (!shouldEnableWebOps()) return;
+-    (async () => {
+-      const [{ webops }, { perfectPlayer, lazyPlayer, clickPlayer }] = await Promise.all([
+-        import('@/webops'),
+-        import('@/games/angle-sorting/scripts'),
+-      ]);
+-      webops.setGameIntent('...');
+-      webops.register('perfect-player', { build: perfectPlayer, ... });
+-      webops.register('lazy-player', { build: lazyPlayer, ... });
+-      webops.register('click-player', { build: clickPlayer, ... });
+-    })();
++    import('@/webops');
+   }, []);
+   return null;
+ }
+```
+
+### CLI 调用对比
+
+**V4.1**:启 webops.go 服务 → curl /webops/diagnose-batch
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... go run webops.go &
+curl -X POST http://localhost:8080/webops/diagnose-batch \
+  -d '{"url": "...", "tags": ["happy-path"]}'
+```
+
+**V5**:直接跑测试程序,它内嵌 chromedp,无需先起服务
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... go run coffee_cloze_test.go -url http://localhost:3000/games/coffee-cloze
+# 或带 fix loop
+go run coffee_cloze_test.go -fix -project-root /path/to/repo -max-rounds 3
+```
 
 ---
 
-## V3 → V4 迁移:确切删除清单
+## FAQ / 排错
 
-V3 项目里需要清理的文件:
+**Q: navigate 后 chromedp 提示 `window.WebOps.runInline` 不存在,polling 超时**
+A: 通常是三种情况之一:
+1. URL 没带 `?webops=1`,Bootstrap 没激活 → 检查 `applyAuditParam` 是否被调用(库内部自动加)
+2. Bootstrap 组件没挂上 → 检查 React 树根 mount 了 `<WebOpsBootstrap />`
+3. 动态 import `@/webops` 编译失败 → 看浏览器 console。`tsconfig.json` 路径 alias 有没配?
 
-**TS 探针侧(全删)**
-- `webops-agent.js`、`viztel-agent.js` 及打包产物
-- `typescript/AgentEntryPoint.ts`(独立注入入口,V4 不再独立打包)
-- `typescript/DOMTelemetryRuntime.ts`、`VirtualChannelManager.ts`、`AudioTelemetryRuntime.ts`、`VisualAttentionModel.ts`、`TelemetryPayloadSchema.ts`
-- `typescript/orchestration/TimelineExecutor.ts`(连同 ATP JSON 协议)
-- `typescript/diagnosis/MarkerAlignmentAnalyzer.ts`、`TopologyChecker.ts`
-- `EntityTracker` / `hashSemantic` / `getMortonCode2D` / `sniffSalientElements` 整套智能嗅探代码
-- V3 的 `sdk/react-webops/` 目录
+**Q: `state_eq("phase", "COMPLETE")` 永远不通过,但实际 store 是 COMPLETE**
+A: 9 成是 `window.useGameStore` 没暴露。在 store 文件里加:
+```ts
+if (typeof window !== 'undefined') (window as any).useGameStore = useGameStore;
+```
+要确认:浏览器 console 里 `useGameStore.getState()` 能返回对象。
 
-**Go 后端(整体替换)**
-- ❌ `webops/store.go`(Redis 流式存储)
-- ❌ `webops/analysis.go`(AnalysisEngine)
-- ❌ `webops/api.go` 中的 `/ouroboros/ingest` 和 `/ouroboros/diagnose` 处理器
-- ❌ `chromedp.ExposeFunction("__OUROBOROS_TUNNEL__", ...)` 注册代码
-- ❌ Redis 客户端依赖
-- ✅ 整体替换为单文件 `webops.go`
+**Q: 想用别的 store 名(不叫 `useGameStore`)**
+A: 在 builder 里改 IR 的 `store` 字段。目前 V5 builder 没暴露这个,如果有需求可以加 `b.Store("useMyStore")` 方法。也可以直接 `script.Store = "useMyStore"` 修改 Build() 返回值。
 
----
+**Q: 我有个谓词组合用上面的词汇表写不出来**
+A: 用 `ExprP("...")` 写 JS 表达式。作用域里有 `store`(整个 state)和 `read`(ReadFn)。复杂逻辑建议先在 store 里加个 derived selector,然后用 `StateGet("mySelector")` 取 — 测试代码更清晰也更稳定。
 
-## V3 vs V4 设计差异速查
+**Q: 一个 tab 能跑多个 scenario 吗?**
+A: 不能。框架强制 1 navigation = 1 scenario(`runSession` 有 in-flight 锁,第二次调用立刻 reject)。并发只在 tab 维度发生。如果你有 N 个 scenario 想跑,Audit 会开 N 个 tab(被 sem 限到 Concurrency)。
 
-| 维度 | V3 | V4 |
-|---|---|---|
-| 探针注入 | chromedp 注入独立 bundle,业务零侵入 | 业务 `import @/webops` |
-| 数据通道 | 流式 → Redis → AnalysisEngine | 一次性 LLMPayload 直接送 LLM |
-| 后端复杂度 | 4 个端点 + Redis + Go 分析引擎 | 1 个文件 + 3 个端点 |
-| 适用范围 | 任何 HTML(智能嗅探) | 仅 React/Next.js + R3F |
-| 调度 | ATP JSON 时间轴(盲跑) | Script DSL(read/branch/loop/dispatch) |
-| 分析时机 | 后端 Go(扫历史 frame) | 前端 TS(同进程拿到完整 session) |
-| Go 侧数据类型 | DTO 全部定义,与前端结构强耦合 | 不定义任何业务结构,JSON 当文本透传 |
-| 并发 | 单流单 worker | 共享 Browser + 信号量 + batch fan-out |
-| 意图建模 | 无 | 三层(game / scenario / action) |
+**Q: Dispatch 的 cases key 排序会影响行为吗?**
+A: 不会。所有 case 的 `else` 都是空,branches 顺序对结果无影响。Builder 排序是为了 IR 输出可复现(便于 diff)。
+
+**Q: ExprP 里能不能 `await`?**
+A: 不能。Predicate 必须同步返回。如果你需要异步等待状态,用 `WaitFor` + 谓词。
+
+**Q: 我已经在用 V4.1,迁移工作量大不大?**
+A: 不大。三个动作:(1) Bootstrap 简化为一行 import,(2) examples TS 文件搬到 Go 用 builder 重写(可参考 `coffee_cloze_test.go` 的模式),(3) store 暴露到 window。框架本体替换 4 个文件即可。

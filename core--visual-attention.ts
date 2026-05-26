@@ -1,6 +1,6 @@
 // core/visual-attention.ts
 // 视觉物理引擎 — 计算元素的"视觉吸引力权重"。
-// 算法 v2.0 stable，与 V3 保持兼容。
+// 算法 v2.0 stable,与 V3 保持兼容。
 
 export interface ElementPhysicalState {
   width: number;

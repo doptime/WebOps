@@ -1,13 +1,13 @@
 // core/r3f-bridge.ts
 // React Three Fiber 桥接 — 把 3D 场景中的对象投影成 VirtualChannel 信号。
 //
-// 工作原理：从 canvas.__r3f.root.getState() 拿到 scene 和 camera，
-//          遍历有名字的 Object3D，把世界坐标 project 到屏幕坐标，
+// 工作原理:从 canvas.__r3f.root.getState() 拿到 scene 和 camera,
+//          遍历有名字的 Object3D,把世界坐标 project 到屏幕坐标,
 //          作为 x/y/z 三个 K 线信号推到 VirtualChannel。
 
 import { VirtualChannel } from './core--virtual-channel';
 
-/** 哪些对象是 R3F 自动生成的"系统节点"，应该跳过。 */
+/** 哪些对象是 R3F 自动生成的"系统节点",应该跳过。 */
 function isSystemNode(name: string): boolean {
   return !name
     || name === 'Scene'
@@ -25,7 +25,7 @@ export class R3FBridge {
     this.idPrefix = idPrefix;
   }
 
-  /** 单帧采样 — 由 SessionRunner 驱动，不存在则空操作。 */
+  /** 单帧采样 — 由 SessionRunner 驱动,不存在则空操作。 */
   sample(): void {
     if (typeof document === 'undefined') return;
     const canvases = document.querySelectorAll('canvas');
@@ -57,7 +57,7 @@ export class R3FBridge {
         const id = `${this.idPrefix}:${name}`;
         this.virtualChannel.pushBatch(id, { sx, sy, sz: v.z });
 
-        // 如果对象有 userData.signals，把它们一起推过来 — 业务可控
+        // 如果对象有 userData.signals,把它们一起推过来 — 业务可控
         if (obj.userData?.signals && typeof obj.userData.signals === 'object') {
           for (const [k, val] of Object.entries(obj.userData.signals)) {
             if (typeof val === 'number') this.virtualChannel.pushMetric(id, k, val);
