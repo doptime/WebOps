@@ -1,10 +1,10 @@
 // report/analyzer.ts
-// 自动诊断 — V4 在前端就能跑出 verdict(V3 是后端 Go AnalysisEngine 跑)。
+// 自动诊断 — V4 在前端就能跑出 verdict（V3 是后端 Go AnalysisEngine 跑）。
 //
-// 三件事:
-//   1. 区间裁决:每对相邻 marker 之间,输入 vs 输出活跃度,判 HEALTHY / NO_RESPONSE / CHAOTIC / AUTONOMOUS / IDLE。
-//   2. 音画同步:动作 marker 后 300ms 内有没有音频 peak。
-//   3. 期望对齐:从 actions / observations 派生通过率。
+// 三件事：
+//   1. 区间裁决：每对相邻 marker 之间，输入 vs 输出活跃度，判 HEALTHY / NO_RESPONSE / CHAOTIC / AUTONOMOUS / IDLE。
+//   2. 音画同步：动作 marker 后 300ms 内有没有音频 peak。
+//   3. 期望对齐：从 actions / observations 派生通过率。
 
 import { TelemetryFrame, SessionReport } from './session--SessionRunner';
 import { activity, isEmpty } from './core--kline';
@@ -79,7 +79,7 @@ function aggregateActivity(frames: TelemetryFrame[], keys: string[]): number[] {
       const m = getMetric(f, k);
       if (m && !isEmpty(m)) acc += activity(m);
     }
-    // 也算一份 DOM weight 的活跃度(输出端常常需要)
+    // 也算一份 DOM weight 的活跃度（输出端常常需要）
     if (keys.includes('__dom_weight__')) {
       for (const node of Object.values(f.domNodes)) {
         if (!isEmpty(node.weight)) acc += activity(node.weight);
@@ -92,27 +92,66 @@ function aggregateActivity(frames: TelemetryFrame[], keys: string[]): number[] {
 function variance(arr: number[]): number {
   if (arr.length < 2) return 0;
   const m = arr.reduce((a, b) => a + b, 0) / arr.length;
-  return arr.reduce((s, v) => s + (v - m) * (v - m), 0) / arr.length;
+  return arr.reduce((a, b) => a + (b - m) ** 2, 0) / arr.length;
 }
 
-function correlation(a: number[], b: number[]): number {
-  const n = Math.min(a.length, b.length);
+function correlation(x: number[], y: number[]): number {
+  const n = Math.min(x.length, y.length);
   if (n < 2) return 0;
-  const ma = a.slice(0, n).reduce((x, y) => x + y, 0) / n;
-  const mb = b.slice(0, n).reduce((x, y) => x + y, 0) / n;
-  let num = 0, da = 0, db = 0;
+  const ax = x.slice(0, n).reduce((a, b) => a + b, 0) / n;
+  const ay = y.slice(0, n).reduce((a, b) => a + b, 0) / n;
+  let num = 0, dx = 0, dy = 0;
   for (let i = 0; i < n; i++) {
-    const xa = a[i] - ma, xb = b[i] - mb;
-    num += xa * xb;
-    da += xa * xa;
-    db += xb * xb;
+    const a = x[i] - ax, b = y[i] - ay;
+    num += a * b; dx += a * a; dy += b * b;
   }
-  if (da === 0 || db === 0) return 0;
-  return num / Math.sqrt(da * db);
+  const den = Math.sqrt(dx * dy);
+  return den === 0 ? 0 : num / den;
 }
 
-export function diagnose(report: SessionReport, cfg: Config = DEFAULT_CFG): DiagnosisReport {
-  // 1. interval 裁决:相邻 marker 之间
+function detectOutputs(frames: TelemetryFrame[], inputs: Set<string>): string[] {
+  const seen = new Set<string>();
+  for (const f of frames) {
+    for (const id of Object.keys(f.virtual)) {
+      if (id.startsWith('__')) continue; // skip __cursor__/__input__/__markers__
+      for (const m of Object.keys(f.virtual[id])) {
+        const k = `${id}:${m}`;
+        if (!inputs.has(k)) seen.add(k);
+      }
+    }
+  }
+  // DOM weight 也作为输出
+  seen.add('__dom_weight__');
+  return Array.from(seen);
+}
+
+function diagnoseInterval(
+  inActivity: number[], outActivity: number[], cfg: Config
+): { verdict: Verdict; confidence: number; corr: number } {
+  const iv = variance(inActivity);
+  const ov = variance(outActivity);
+  const corr = correlation(inActivity, outActivity);
+  const hasIn = iv > cfg.thresholds.inputVar;
+  const hasOut = ov > cfg.thresholds.outputVar;
+  const correlated = Math.abs(corr) > cfg.thresholds.correlation;
+
+  if (!hasIn && !hasOut) return { verdict: 'IDLE', confidence: 0.9, corr };
+  if (hasIn && !hasOut) return { verdict: 'NO_RESPONSE', confidence: 0.95, corr };
+  if (!hasIn && hasOut) return { verdict: 'AUTONOMOUS', confidence: 0.8, corr };
+  if (correlated) return { verdict: 'HEALTHY', confidence: Math.min(0.99, 0.5 + Math.abs(corr)), corr };
+  return { verdict: 'CHAOTIC', confidence: 0.7, corr };
+}
+
+export function diagnose(report: SessionReport, override?: Partial<Config>): DiagnosisReport {
+  const cfg: Config = {
+    ...DEFAULT_CFG,
+    ...override,
+    thresholds: { ...DEFAULT_CFG.thresholds, ...(override?.thresholds ?? {}) }
+  };
+  const inputs = new Set(cfg.inputSignals);
+  const outputs = cfg.outputSignals ?? detectOutputs(report.frames, inputs);
+
+  // 1. 区间分析
   const intervals: IntervalDiagnosis[] = [];
   const allMarkers = [
     { name: '__SCENARIO_START__', ts: report.startTs },
@@ -121,54 +160,44 @@ export function diagnose(report: SessionReport, cfg: Config = DEFAULT_CFG): Diag
   ].sort((a, b) => a.ts - b.ts);
 
   for (let i = 0; i < allMarkers.length - 1; i++) {
-    const from = allMarkers[i];
-    const to = allMarkers[i + 1];
-    const slice = report.frames.filter((f) => f.ts >= from.ts && f.ts <= to.ts);
-    if (slice.length < 2) continue;
-
+    const a = allMarkers[i];
+    const b = allMarkers[i + 1];
+    if (b.ts - a.ts < 50) continue;
+    const slice = report.frames.filter((f) => f.ts >= a.ts && f.ts <= b.ts);
     const inAct = aggregateActivity(slice, cfg.inputSignals);
-    const outAct = aggregateActivity(slice, ['__dom_weight__']);
-    const inV = variance(inAct);
-    const outV = variance(outAct);
-    const corr = correlation(inAct, outAct);
-
-    let verdict: Verdict = 'HEALTHY';
-    if (inV < cfg.thresholds.inputVar && outV < cfg.thresholds.outputVar) verdict = 'IDLE';
-    else if (inV < cfg.thresholds.inputVar && outV >= cfg.thresholds.outputVar) verdict = 'AUTONOMOUS';
-    else if (inV >= cfg.thresholds.inputVar && outV < cfg.thresholds.outputVar) verdict = 'NO_RESPONSE';
-    else if (corr < -cfg.thresholds.correlation) verdict = 'CHAOTIC';
-
+    const outAct = aggregateActivity(slice, outputs);
+    const { verdict, confidence, corr } = diagnoseInterval(inAct, outAct, cfg);
     intervals.push({
-      fromMarker: from.name,
-      toMarker: to.name,
-      startTs: from.ts,
-      endTs: to.ts,
-      durationMs: to.ts - from.ts,
-      inputActivity: inAct.reduce((a, b) => a + b, 0),
-      outputActivity: outAct.reduce((a, b) => a + b, 0),
+      fromMarker: a.name,
+      toMarker: b.name,
+      startTs: a.ts,
+      endTs: b.ts,
+      durationMs: b.ts - a.ts,
+      inputActivity: inAct.reduce((s, x) => s + x, 0),
+      outputActivity: outAct.reduce((s, x) => s + x, 0),
       correlation: corr,
       verdict,
-      confidence: Math.min(1, slice.length / 10)
+      confidence
     });
   }
 
-  // 2. audio sync:每个 click/key/drag/type 动作后 300ms 内的 audio peak
+  // 2. 音画同步
   const audioSyncs: AudioSync[] = [];
+  const hasAudio = report.frames.some((f) => f.virtual['__audio__']?.['peak']);
   for (const a of report.actions) {
-    if (a.kind !== 'click' && a.kind !== 'key' && a.kind !== 'drag' && a.kind !== 'type') continue;
+    if (a.kind !== 'click' && a.kind !== 'key' && a.kind !== 'drag') continue;
     const ts = a.startTs;
-    const winFrames = report.frames.filter((f) => f.ts >= ts && f.ts <= ts + 600);
+    const window = report.frames.filter((f) => f.ts >= ts && f.ts <= ts + 600);
     let peakMax = 0;
     let peakTs = 0;
-    for (const f of winFrames) {
-      const m = f.virtual['__audio__']?.peak;
-      if (m && !isEmpty(m) && (m.h as number) > peakMax) {
-        peakMax = m.h as number;
+    for (const f of window) {
+      const peak = f.virtual['__audio__']?.['peak'];
+      if (peak && !isEmpty(peak) && (peak.h as number) > peakMax) {
+        peakMax = peak.h as number;
         peakTs = f.ts;
       }
     }
-    let verdict: AudioVerdict = 'NO_AUDIO_TRACKED';
-    const hasAudio = report.frames.some((f) => f.virtual['__audio__']);
+    let verdict: AudioVerdict;
     if (!hasAudio) verdict = 'NO_AUDIO_TRACKED';
     else if (peakMax < cfg.thresholds.audioPeak) verdict = 'FAIL_SILENT';
     else if (peakTs - ts > cfg.thresholds.audioLagMs) verdict = 'FAIL_LAG';
@@ -196,9 +225,9 @@ export function diagnose(report: SessionReport, cfg: Config = DEFAULT_CFG): Diag
   const alerts: string[] = [];
   for (const iv of intervals) {
     if (iv.verdict === 'NO_RESPONSE')
-      alerts.push(`[${iv.fromMarker} -> ${iv.toMarker}] 死锁:输入活跃但屏幕无反应`);
+      alerts.push(`[${iv.fromMarker} -> ${iv.toMarker}] 死锁：输入活跃但屏幕无反应`);
     else if (iv.verdict === 'CHAOTIC')
-      alerts.push(`[${iv.fromMarker} -> ${iv.toMarker}] 混乱:输入与输出方向不匹配(corr=${iv.correlation.toFixed(2)})`);
+      alerts.push(`[${iv.fromMarker} -> ${iv.toMarker}] 混乱：输入与输出方向不匹配（corr=${iv.correlation.toFixed(2)}）`);
   }
   for (const a of audioSyncs) {
     if (a.verdict === 'FAIL_SILENT') alerts.push(`[${a.actionName}] 关键动作后静音`);

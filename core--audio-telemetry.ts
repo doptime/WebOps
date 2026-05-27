@@ -1,9 +1,9 @@
 // core/audio-telemetry.ts
 // 音频探针 — 通过 Monkey-Patch AudioContext 自动捕捉所有声音输出。
 //
-// V4 改动:
-//   - sample() 由 SessionRunner 在统一时钟下驱动,不再独立 RAF。
-//   - flush 直接调用 VirtualChannel.pushAggregated,避免双层聚合丢失极值。
+// V4 改动：
+//   - sample() 由 SessionRunner 在统一时钟下驱动，不再独立 RAF。
+//   - flush 直接调用 VirtualChannel.pushAggregated，避免双层聚合丢失极值。
 
 import { AggregatedMetric, emptyMetric, pushValue, isEmpty } from './core--kline';
 import { VirtualChannel } from './core--virtual-channel';
@@ -21,7 +21,7 @@ export class AudioTelemetry {
     this.virtualChannel = virtualChannel;
   }
 
-  /** 启动 — 安装 Monkey-Patch,新建的所有 AudioContext 都会被自动捕获。 */
+  /** 启动 — 安装 Monkey-Patch，新建的所有 AudioContext 都会被自动捕获。 */
   start(): void {
     if (this.originalAudioContext) return;
     if (typeof window === 'undefined') return;

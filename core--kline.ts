@@ -1,7 +1,7 @@
 // core/kline.ts
 // 统一 K 线 (Universal K-Line) — 所有信号的最小公约数。
-// V4 改动:抽离独立模块,移除哨兵值不一致问题(V3 中 -1 / null 两套并存)。
-//          统一用 null 作为空指标的唯一表示,外部判断使用 isEmpty()。
+// V4 改动：抽离独立模块，移除哨兵值不一致问题（V3 中 -1 / null 两套并存）。
+//          统一用 null 作为空指标的唯一表示，外部判断使用 isEmpty()。
 
 export interface AggregatedMetric {
   o: number | null; // open
@@ -27,7 +27,7 @@ export function pushValue(m: AggregatedMetric, v: number): void {
   m.n = (m.n ?? 0) + 1;
 }
 
-/** 把现成的另一根 K 线(如音频已经聚合好的)合并进来,避免二次聚合丢失极值。 */
+/** 把现成的另一根 K 线（如音频已经聚合好的）合并进来，避免二次聚合丢失极值。 */
 export function mergeMetric(dst: AggregatedMetric, src: AggregatedMetric): void {
   if (isEmpty(src)) return;
   if (isEmpty(dst)) {
@@ -46,7 +46,7 @@ export function activity(m: AggregatedMetric): number {
   return ((m.h as number) - (m.l as number)) + Math.abs((m.c as number) - (m.o as number));
 }
 
-/** 把 K 线"翻页":把当前 close 作为下一根 K 线的 open,开启新窗口。 */
+/** 把 K 线"翻页"：把当前 close 作为下一根 K 线的 open，开启新窗口。 */
 export function rollOver(m: AggregatedMetric): AggregatedMetric {
   if (isEmpty(m)) return emptyMetric();
   const c = m.c as number;

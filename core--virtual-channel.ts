@@ -1,10 +1,10 @@
 // core/virtual-channel.ts
 // 虚拟信道 — 业务逻辑信号的统一入口。
 //
-// V4 改动:
-//   - 移除 standalone tick 模式:V4 中所有 flush 都由 SessionRunner 主导,避免双 RAF 循环。
-//   - 移除环形缓冲:V4 数据落地到内存中的 Recorder,没有"隧道未就绪"问题。
-//   - 不再发送 JSON 字符串,直接吐对象给 Recorder。
+// V4 改动：
+//   - 移除 standalone tick 模式：V4 中所有 flush 都由 SessionRunner 主导，避免双 RAF 循环。
+//   - 移除环形缓冲：V4 数据落地到内存中的 Recorder，没有"隧道未就绪"问题。
+//   - 不再发送 JSON 字符串，直接吐对象给 Recorder。
 
 import { AggregatedMetric, emptyMetric, isEmpty, pushValue, mergeMetric } from './core--kline';
 
@@ -35,7 +35,7 @@ export class VirtualChannel {
     }
   }
 
-  /** 推送已经聚合好的 K 线(如 Audio 端 10Hz 采样的极值)。 */
+  /** 推送已经聚合好的 K 线（如 Audio 端 10Hz 采样的极值）。 */
   pushAggregated(targetId: string, metricKey: string, metric: AggregatedMetric): void {
     if (isEmpty(metric)) return;
     const key = `${targetId}:${metricKey}`;
@@ -49,7 +49,7 @@ export class VirtualChannel {
     }
   }
 
-  /** 收割所有非空信号 — 收割后 buffer 翻页(用 close 续接,避免长尾断点)。 */
+  /** 收割所有非空信号 — 收割后 buffer 翻页（用 close 续接，避免长尾断点）。 */
   harvest(): Record<string, Record<string, AggregatedMetric>> {
     const out: Record<string, Record<string, AggregatedMetric>> = {};
     for (const [key, ctx] of this.signals.entries()) {
@@ -59,7 +59,7 @@ export class VirtualChannel {
       const metricKey = idx === -1 ? 'value' : key.substring(idx + 1);
       if (!out[targetId]) out[targetId] = {};
       out[targetId][metricKey] = { ...ctx.buffer };
-      // 翻页:close 作为下一窗口的 open,序列连续。
+      // 翻页：close 作为下一窗口的 open，序列连续。
       const c = ctx.buffer.c as number;
       ctx.buffer = { o: c, h: c, l: c, c: c, n: 0 };
     }

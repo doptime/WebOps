@@ -1,14 +1,14 @@
 // react/useTrack.ts
-// React 端的两个轻量 helper:
+// React 端的两个轻量 helper：
 //   1. useTrack(id, opts) — 给 JSX 元素生成 data-vt-id / data-vt-watch 属性。
-//   2. usePushSignal()    — 在组件中手动推自定义信号(如分数变化、关键事件)。
+//   2. usePushSignal()    — 在组件中手动推自定义信号（如分数变化、关键事件）。
 //
-// 这些 hook 在没有 SessionRunner 跑的时候完全空转,安全可生产环境保留。
+// 这些 hook 在没有 SessionRunner 跑的时候完全空转，安全可生产环境保留。
 
 import { useMemo, useEffect, useRef } from 'react';
 
 export interface TrackOptions {
-  /** 监听 CSS 属性:rotation / scale / opacity / width / height 等 */
+  /** 监听 CSS 属性：rotation / scale / opacity / width / height 等 */
   watch?: string[];
 }
 
@@ -28,7 +28,7 @@ export function usePushSignal() {
   }).current;
 }
 
-/** 在某个值变化时自动推一次(节流到 React 渲染节奏)。 */
+/** 在某个值变化时自动推一次（节流到 React 渲染节奏）。 */
 export function useSignalBinding(
   targetId: string,
   key: string,
