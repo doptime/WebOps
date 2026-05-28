@@ -29,9 +29,9 @@ export class ActionDispatcher {
     this.sink = sink;
   }
 
-  resolve(target: TargetSpec): { x: number; y: number } | null {
+  resolve(target: TargetSpec): { x: number; y: number; el: Element | null } | null {
     if (typeof target === 'object' && 'x' in target && 'y' in target) {
-      return { x: target.x, y: target.y };
+      return { x: target.x, y: target.y, el: null };
     }
     let selector: string | null = null;
     if (typeof target === 'string') {
@@ -47,7 +47,7 @@ export class ActionDispatcher {
     const el = document.querySelector(selector);
     if (!el) return null;
     const rect = el.getBoundingClientRect();
-    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, el };
   }
 
   async moveCursor(to: { x: number; y: number }, strategy: Strategy): Promise<void> {
@@ -79,10 +79,10 @@ export class ActionDispatcher {
     }
 
     this.isMouseDown = true;
-    this.dispatch('mousedown', pos.x, pos.y);
+    this.dispatch('mousedown', pos.x, pos.y, pos.el);
     this.isMouseDown = false;
-    this.dispatch('mouseup', pos.x, pos.y);
-    this.dispatch('click', pos.x, pos.y);
+    this.dispatch('mouseup', pos.x, pos.y, pos.el);
+    this.dispatch('click', pos.x, pos.y, pos.el);
     this.sink.push('click', targetName(target), { detail: pos });
     return true;
   }
@@ -130,8 +130,8 @@ export class ActionDispatcher {
     return true;
   }
 
-  private dispatch(type: string, x: number, y: number): void {
-    const el = document.elementFromPoint(x, y) || document.body;
+  private dispatch(type: string, x: number, y: number, targetEl?: Element | null): void {
+    const el = targetEl || document.elementFromPoint(x, y) || document.body;
     const map: Record<string, string> = {
       mousedown: 'pointerdown',
       mouseup: 'pointerup',
