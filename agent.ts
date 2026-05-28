@@ -160,7 +160,7 @@ class WebOpsAgent {
    * [V5.1] 直接执行从 Go 灌进来的 JS 脚本源码。
    *
    * source 是脚本代码体(顶层支持 await),会被 AsyncFunction 包成
-   *   async function(webops) { /* source */ }
+   *   async function(webops) { // source }
    * 然后用 webops 助手实例调用一次。
    *
    * ctx = { scenarioId, intent, hypothesis, tags } —— 透传给 payload 元字段。
@@ -175,7 +175,6 @@ class WebOpsAgent {
       const payload = await runV5Script(source, ctx);
       return JSON.stringify(payload);
     } catch (e) {
-      // 脚本编译/启动期的硬错(JS 语法错、Function 构造失败)
       return JSON.stringify({
         error: 'RUN_SCRIPT_FAILED',
         scenarioId: ctx?.scenarioId,
@@ -460,7 +459,7 @@ async function runV5Script(source: string, scenarioCtx: V5ScenarioCtx): Promise<
   }
 
   if (aborted) payload.aborted = aborted;
-  payload.finalStore = helper.state();
+  payload.finalStore = {};
   payload.durationMs = Math.round(performance.now() - payload.startedAt);
-  return payload;
+  return JSON.stringify(payload);
 }
