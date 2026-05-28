@@ -1,7 +1,7 @@
 {
-  "name": "@webops/v5",
-  "version": "5.0.0",
-  "description": "WebOps — One-call session telemetry for React/Next.js/R3F apps. V4 (TS-first) + V5 (Go-first) coexist.",
+  "name": "@webops/v6",
+  "version": "6.0.0",
+  "description": "WebOps V6 — drive a React/Next.js/R3F app, capture the session as video frames + audio + a ms-anchored event timeline, and feed it to a multimodal model (Qwen3-Omni via vLLM). No K-line, no numeric telemetry.",
   "type": "module",
   "main": "./agent.ts",
   "exports": {
@@ -10,6 +10,7 @@
     "./script": "./script--Script.ts",
     "./session": "./session--SessionRunner.ts",
     "./report": "./report--ReportBuilder.ts",
+    "./media": "./report--MediaPayload.ts",
     "./react": "./react--useTrack.ts",
     "./zustand": "./react--zustand-telemetry.ts"
   },

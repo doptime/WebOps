@@ -1,4 +1,6 @@
 // runtime.ts — 轻量运行时入口,游戏组件静态 import 这个文件。
+// V6 不变:useTrack 仍生成 data-vt-id(动作定位用),shouldEnableWebOps 仍是生产闸门。
+// 重型审计单例(SessionRunner / AudioCapture / agent)仍由 Bootstrap 动态 import('@/webops')。
 //
 // 设计目标: 让 import "@/webops/runtime" 不会拖入 SessionRunner / ReportBuilder /
 // analyzer / 6 个 core 探针等任何重量级模块,从而生产 bundle 不增加任何审计代码。

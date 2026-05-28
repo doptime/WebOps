@@ -1,15 +1,14 @@
-// script/actions.ts
+// script/actions.ts  (V6)
 // 动作执行器 — 把 StepIR 翻译为浏览器事件。
-// V3 中这部分逻辑在 TimelineExecutor 里。V4 把它拆出来，让 SessionRunner 直接调用。
+//
+// V6 唯一改动:不再向 VirtualChannel 推 __input__/__cursor__ 数值 K 线
+// (那是给文本 LLM 的数值轨道,已随 K 线一起取消)。改为向 EventSink 记一条
+// 带毫秒时间戳的输入事件,作为多模态模型对齐视频帧的时间锚。
+// 派发逻辑(linearPath / PointerEvent / KeyboardEvent)与 V4.1 完全一致。
 
 import { TargetSpec, Strategy } from './script--Script';
-import { VirtualChannel } from './core--virtual-channel';
+import { EventSink } from './core--event-sink';
 
-// V4.1: 删除手写三阶贝塞尔 + 拟人轨迹。
-//   本工具是第一方内部审计器（headless chromedp 跑自家游戏），没有反爬对抗需求。
-//   humanLikePath 的控制点掺了 Math.random()，对审计而言随机抖动是在主动破坏可复现性。
-//   一切移动统一走确定性 linearPath：既可复现，又仍逐点派发 pointermove，
-//   让游戏侧的 hover / drag 监听照样被触发。
 function linearPath(sx: number, sy: number, ex: number, ey: number, steps: number) {
   const out: { x: number; y: number }[] = [];
   for (let i = 0; i <= steps; i++) {
@@ -24,14 +23,10 @@ export class ActionDispatcher {
   private cursorX = 0;
   private cursorY = 0;
   private isMouseDown = false;
-  private vc: VirtualChannel;
+  private sink: EventSink;
 
-  constructor(virtualChannel: VirtualChannel) {
-    this.vc = virtualChannel;
-    // V4.1: 不再在构造期向 document 挂全局 mousemove 监听。
-    //   原监听只为捕获"真人"光标位置，但 headless 审计里没有真人，
-    //   光标位置完全由 moveCursor / dispatch 自己维护。该监听是纯死重，
-    //   且因从不注销，在多 tab 反复冷启动场景下是潜在泄漏源。
+  constructor(sink: EventSink) {
+    this.sink = sink;
   }
 
   resolve(target: TargetSpec): { x: number; y: number } | null {
@@ -77,11 +72,10 @@ export class ActionDispatcher {
     await this.moveCursor(pos, strategy);
 
     if (mode === 'native' && typeof target === 'string') {
-      // 直接调 DOM .click()，跳过 PointerEvent —— 适合普通 button
       const sel = target.startsWith('[') || target.startsWith('.') || target.startsWith('#')
         ? target : `[data-vt-id="${target}"]`;
       const el = document.querySelector<HTMLElement>(sel);
-      if (el) { el.click(); this.vc.pushMetric('__input__', 'click', 1); return true; }
+      if (el) { el.click(); this.sink.push('click', String(target), { detail: pos }); return true; }
     }
 
     this.isMouseDown = true;
@@ -89,7 +83,7 @@ export class ActionDispatcher {
     this.isMouseDown = false;
     this.dispatch('mouseup', pos.x, pos.y);
     this.dispatch('click', pos.x, pos.y);
-    this.vc.pushMetric('__input__', 'click', 1);
+    this.sink.push('click', targetName(target), { detail: pos });
     return true;
   }
 
@@ -101,7 +95,6 @@ export class ActionDispatcher {
     this.isMouseDown = true;
     this.dispatch('mousedown', a.x, a.y);
     const steps = Math.max(10, Math.floor(durationMs / 16));
-    // strategy 仍保留在签名里以兼容 Script DSL，但路径恒为确定性 linear。
     const path = linearPath(a.x, a.y, b.x, b.y, steps);
     for (const p of path) {
       this.dispatch('mousemove', p.x, p.y);
@@ -111,6 +104,7 @@ export class ActionDispatcher {
     }
     this.isMouseDown = false;
     this.dispatch('mouseup', this.cursorX, this.cursorY);
+    this.sink.push('drag', `${targetName(from)}→${targetName(to)}`, { detail: { from: a, to: b } });
     return true;
   }
 
@@ -123,16 +117,16 @@ export class ActionDispatcher {
       el.dispatchEvent(new Event('input', { bubbles: true }));
       if (strategy === 'human_like') await sleep(50 + Math.random() * 80);
     }
+    this.sink.push('type', text.slice(0, 24));
     return true;
   }
 
-  /** 派发 keydown + keyup，适合像 SortingChaos 那样的 a/s/d 按键玩法。 */
   key(key: string): boolean {
     const target = document.activeElement || document.body;
     const init: KeyboardEventInit = { key, bubbles: true, cancelable: true };
     target.dispatchEvent(new KeyboardEvent('keydown', init));
     target.dispatchEvent(new KeyboardEvent('keyup', init));
-    this.vc.pushMetric('__input__', 'key', 1);
+    this.sink.push('key', key);
     return true;
   }
 
@@ -158,7 +152,14 @@ export class ActionDispatcher {
       el.dispatchEvent(new MouseEvent(type, init));
     }
     if (type === 'mousemove') {
-      this.vc.pushBatch('__cursor__', { x, y });
+      this.sink.push('cursor', 'move', { detail: { x, y } }); // 默认被 EventSink 丢弃
     }
   }
+}
+
+function targetName(t: TargetSpec): string {
+  if (typeof t === 'string') return t;
+  if ('vtId' in t) return t.vtId;
+  if ('selector' in t) return t.selector;
+  return `(${t.x},${t.y})`;
 }

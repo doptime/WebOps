@@ -1,315 +1,237 @@
-// session/SessionRunner.ts
-// 一体化 Session 执行器 — V4 的单点入口。
+// session/SessionRunner.ts  (V6)
+// 一体化 Session 执行器 —— 仍是单点入口,仍跑 Script DSL 的 steps。
 //
-// V4.1 新增：
-//   - ActionRecord 携带 `intent`：从 StepIR 透传，给 LLM 看的语义注解。
-//   - maxFrames 上限：避免长跑 session 把 frames 数组堆爆，超过时丢中段保两端。
+// 与 V4 的根本差别:V4 在 RAF 循环里 60fps 采 DOM/audio/r3f 数值 → K 线 → frames。
+// V6 不采任何数值。它做三件事:
+//   1. 与驱动器握手,确保"视频 screencast / 音频录制"在脚本派发任何动作之前已经开始,
+//      并把这一刻锁成统一时间零点 t0(captureT0)。
+//   2. 照常执行 steps;每个动作/marker/observe/expect/read 落成一条 EventSink 时间锚事件。
+//   3. 结束时停音频录制,返回 MediaSessionReport(timeline + state + 音频 base64)。
+//      视频帧由驱动器侧 CDP 截帧补齐,与 t0 对齐。
+//
+// 捕获生命周期(armCapture/anchor/音频起停)抽到 withCapture(),V4(runSession)与
+// V5(runWith)共用,保证两条路径的媒体采集行为完全一致。
 
 import { CompiledScript, StepIR, ReadFn } from './script--Script';
 import { ActionDispatcher } from './script--actions';
-import { VirtualChannel } from './core--virtual-channel';
-import { DOMTelemetry, DOMSnapshot } from './core--dom-telemetry';
-import { AudioTelemetry } from './core--audio-telemetry';
-import { R3FBridge } from './core--r3f-bridge';
-import { AggregatedMetric } from './core--kline';
-
-export interface TelemetryFrame {
-  ts: number;
-  dur: number;
-  sources: ('dom' | 'virtual' | 'audio' | 'r3f')[];
-  domNodes: DOMSnapshot['nodes'];
-  virtual: Record<string, Record<string, AggregatedMetric>>;
-}
-
-export interface ActionRecord {
-  index: number;
-  kind: StepIR['kind'];
-  name: string;
-  startTs: number;
-  endTs: number;
-  ok: boolean;
-  /** 自然语言解释这一步在做什么 / 期望什么反应（来自 StepIR.intent）。 */
-  intent?: string;
-  // 对 observe / expect / read 步骤而言，记录其结果
-  result?: any;
-  // 对 click / drag 等而言，记录目标坐标
-  meta?: Record<string, any>;
-  error?: string;
-}
-
-export interface SessionReport {
-  scenarioId: string;
-  startTs: number;
-  endTs: number;
-  durationMs: number;
-  url: string;
-  frames: TelemetryFrame[];
-  actions: ActionRecord[];
-  /** 显式打的 markers（不含 __SCENARIO_*__）。 */
-  markers: { name: string; ts: number; meta?: Record<string, any> }[];
-  /** read() 收集的最终值（便于 LLM 看上下文）。 */
-  reads: Record<string, any>;
-  /** observe() 与 expect() 的总览。 */
-  observations: { name: string; ts: number; passed: boolean; required: boolean }[];
-  errors: string[];
-  /** 是否因为 expect 失败而中止。 */
-  abortedAt?: number;
-  /** 是否因为 frame buffer 上限触发了截断（信息字段，便于 LLM 判断信号是否完整）。 */
-  framesTruncated?: boolean;
-}
+import { EventSink } from './core--event-sink';
+import { AudioCapture } from './core--audio-capture';
+import { MediaSessionReport } from './report--MediaPayload';
 
 export interface RunnerOptions {
-  flushIntervalMs?: number;
   enableAudio?: boolean;
-  enableR3F?: boolean;
-  /** Frame 缓冲上限。超过时丢中段、保两端，避免长跑 session 让 LLMPayload 爆炸。 */
-  maxFrames?: number;
+  captureAckTimeoutMs?: number;
+  recordCursor?: boolean;
+}
+
+/** 给 V5 脚本体的执行上下文:同一个 sink/dispatcher + 可写的 state 快照。
+ *  body 可回传它自己收集的 observations(V5 脚本经 helper 的 observe/expect/waitFor 产生),
+ *  withCapture 会并入 report.observations —— 否则 V5 路径的 observations 会是空的。 */
+export interface SessionBody {
+  (sink: EventSink, dispatcher: ActionDispatcher, state: Record<string, unknown>):
+    Promise<{ aborted?: string | null; observations?: MediaSessionReport['observations'] } | void>;
 }
 
 export class SessionRunner {
-  private vc: VirtualChannel;
-  private dom: DOMTelemetry;
-  private audio: AudioTelemetry;
-  private r3f: R3FBridge;
-  private actions: ActionDispatcher;
-  private rafId: number | null = null;
-  private active = false;
-  private flushIntervalMs: number;
+  private sink: EventSink;
+  private audio: AudioCapture;
+  private dispatcher: ActionDispatcher;
   private enableAudio: boolean;
-  private enableR3F: boolean;
-  private maxFrames: number;
+  private captureAckTimeoutMs: number;
 
   constructor(opts: RunnerOptions = {}) {
-    this.flushIntervalMs = opts.flushIntervalMs ?? 100;
     this.enableAudio = opts.enableAudio ?? true;
-    this.enableR3F = opts.enableR3F ?? true;
-    this.maxFrames = opts.maxFrames ?? 800;
-    this.vc = new VirtualChannel();
-    this.dom = new DOMTelemetry(this.vc);
-    this.audio = new AudioTelemetry(this.vc);
-    this.r3f = new R3FBridge(this.vc);
-    this.actions = new ActionDispatcher(this.vc);
+    this.captureAckTimeoutMs = opts.captureAckTimeoutMs ?? 2000;
+    this.sink = new EventSink({ recordCursor: opts.recordCursor });
+    this.audio = new AudioCapture();
+    this.dispatcher = new ActionDispatcher(this.sink);
   }
 
-  /** 从 SessionRunner 外部直接打 marker（适合在业务回调里用）。 */
-  mark(name: string, meta?: Record<string, any>): void {
-    this.vc.pushMetric('__markers__', name, performance.now());
-    if (meta) {
-      // 把 meta 里的数值字段也挂到 vc 上 — 让 LLM 在帧里能看到上下文
-      for (const [k, v] of Object.entries(meta)) {
-        if (typeof v === 'number') this.vc.pushMetric('__markers__', `${name}:${k}`, v);
-      }
-    }
-    this.markersMeta.push({ name, ts: performance.now(), meta });
+  mark(name: string, meta?: Record<string, unknown>): void {
+    this.sink.push('marker', name, { detail: meta });
   }
 
-  /** 主入口 —— 跑完返回完整 Report。 */
-  async runSession(script: CompiledScript): Promise<SessionReport> {
-    const startTs = performance.now();
-    const startUrl = typeof window !== 'undefined' ? window.location.href : '';
-    this.frames = [];
-    this.actionRecords = [];
+  /** [V4] 跑一个 CompiledScript。 */
+  async runSession(script: CompiledScript): Promise<MediaSessionReport> {
+    return this.withCapture(async (sink, dispatcher, state) => {
+      let aborted: string | null = null;
+      await this.executeSteps(script.steps, script, sink, dispatcher, state,
+        () => aborted !== null, (r) => { aborted = r; });
+      return { aborted };
+    }, script.scenarioId);
+  }
+
+  /** [V5] 跑任意脚本体(agent.runScript 用),共用同一套捕获生命周期。 */
+  async runWith(body: SessionBody, ctx: { scenarioId: string }): Promise<MediaSessionReport> {
+    return this.withCapture(body, ctx.scenarioId);
+  }
+
+  // ---------- 捕获生命周期(V4/V5 共用) ----------
+
+  private async withCapture(body: SessionBody, scenarioId: string): Promise<MediaSessionReport> {
+    const url = typeof window !== 'undefined' ? window.location.href : '';
+    const state: Record<string, unknown> = {};
     this.observations = [];
-    this.reads = {};
-    this.markersMeta = [];
     this.errors = [];
-    this.framesTruncated = false;
 
-    // 1. 启动所有探针
-    this.dom.start();
     if (this.enableAudio) this.audio.start();
-    this.startTickLoop();
-    this.active = true;
-    this.vc.pushMetric('__markers__', '__SCENARIO_START__', startTs);
-    this.markersMeta.push({ name: '__SCENARIO_START__', ts: startTs });
+    const t0 = await this.armCapture();
+    this.sink.anchor(t0);
 
-    // 2. 设置硬超时
-    const deadline = startTs + script.sessionTimeoutMs;
-    const isTimedOut = () => performance.now() > deadline;
-
-    let abortedAt: number | undefined;
+    let aborted = false;
     try {
-      await this.executeSteps(script.steps, script, isTimedOut, () => abortedAt !== undefined,
-        (idx) => { abortedAt = idx; });
+      const r = await body(this.sink, this.dispatcher, state);
+      if (r && r.aborted) aborted = true;
+      if (r && r.observations && r.observations.length) {
+        this.observations.push(...r.observations);
+      }
     } catch (e) {
       this.errors.push(`Top-level: ${String(e)}`);
     }
 
-    // 3. 给最后的动画/音效落地时间
-    await new Promise((r) => setTimeout(r, 600));
-
-    const endTs = performance.now();
-    this.vc.pushMetric('__markers__', '__SCENARIO_END__', endTs);
-    this.markersMeta.push({ name: '__SCENARIO_END__', ts: endTs });
-
-    // 4. 最后再 flush 一次，捕获扫尾的动画和音效。
-    this.tickOnce(true);
-
-    // 5. 关停
-    this.active = false;
-    if (this.rafId !== null) cancelAnimationFrame(this.rafId);
-    this.dom.stop();
-    if (this.enableAudio) this.audio.stop();
+    await sleep(600); // 收尾动画/音效落地
+    const endTs = nowMs();
+    this.disarmCapture();
+    const audio = this.enableAudio
+      ? await this.audio.stop()
+      : { mimeType: '', base64: '', durationMs: 0, captured: false };
 
     return {
-      scenarioId: script.scenarioId,
-      startTs, endTs,
-      durationMs: endTs - startTs,
-      url: startUrl,
-      frames: this.frames,
-      actions: this.actionRecords,
-      markers: this.markersMeta.filter((m) => !m.name.startsWith('__SCENARIO_')),
-      reads: { ...this.reads },
+      scenarioId, url, startTs: t0, endTs, durationMs: Math.round(endTs - t0),
+      timeline: this.sink.harvest(),
+      state,
       observations: this.observations,
       errors: this.errors,
-      abortedAt,
-      framesTruncated: this.framesTruncated
+      aborted,
+      audio,
     };
   }
 
-  // ---------- internals ----------
+  /**
+   * 通知驱动器开始录像,等待确认。协议见 driver/cdp-screencast：
+   *   window.__WEBOPS_CAPTURE__ = { state:'arm' } → 驱动器 startScreencast → 置 __WEBOPS_CAPTURE_ACK__=true
+   * 无驱动器(本地 dev)超时直接返回当前时刻,session 照跑(只是没视频帧)。
+   */
+  private async armCapture(): Promise<number> {
+    if (typeof window === 'undefined') return nowMs();
+    (window as any).__WEBOPS_CAPTURE__ = { state: 'arm' };
+    (window as any).__WEBOPS_CAPTURE_ACK__ = false;
+    const deadline = nowMs() + this.captureAckTimeoutMs;
+    while (nowMs() < deadline) {
+      if ((window as any).__WEBOPS_CAPTURE_ACK__ === true) break;
+      await sleep(25);
+    }
+    return nowMs();
+  }
 
-  private frames: TelemetryFrame[] = [];
-  private actionRecords: ActionRecord[] = [];
-  private observations: SessionReport['observations'] = [];
-  private reads: Record<string, any> = {};
-  private markersMeta: SessionReport['markers'] = [];
+  private disarmCapture(): void {
+    if (typeof window === 'undefined') return;
+    (window as any).__WEBOPS_CAPTURE__ = { state: 'stop' };
+  }
+
+  // ---------- step 执行(与 V4.1 同构,去掉 vc 推送) ----------
+
+  private observations: MediaSessionReport['observations'] = [];
   private errors: string[] = [];
-  private lastFlushTs = 0;
-  private framesTruncated = false;
 
   private async executeSteps(
-    steps: StepIR[],
-    script: CompiledScript,
-    isTimedOut: () => boolean,
-    isAborted: () => boolean,
-    setAborted: (idx: number) => void
+    steps: StepIR[], script: CompiledScript,
+    sink: EventSink, dispatcher: ActionDispatcher, state: Record<string, unknown>,
+    isAborted: () => boolean, setAborted: (r: string) => void
   ): Promise<void> {
     for (let i = 0; i < steps.length; i++) {
-      if (isAborted() || isTimedOut()) return;
+      if (isAborted()) return;
       const step = steps[i];
-      const startTs = performance.now();
-      // intent 字段在所有 StepIR variant 上都是可选,这里统一透传
-      const stepIntent = (step as { intent?: string }).intent;
-      let record: ActionRecord = {
-        index: i,
-        kind: step.kind,
-        name: this.stepName(step),
-        startTs,
-        endTs: startTs,
-        ok: true,
-        intent: stepIntent
-      };
+      const intent = (step as { intent?: string }).intent;
       try {
-        await this.executeOne(step, script, record);
+        await this.executeOne(step, script, sink, dispatcher, state, intent);
       } catch (e) {
-        record.ok = false;
-        record.error = String(e);
         this.errors.push(`Step ${i} (${step.kind}): ${e}`);
+        sink.push('error', this.stepName(step), { intent, detail: String(e) });
       }
-      record.endTs = performance.now();
-      this.actionRecords.push(record);
-
-      // expect 失败 + 不允许继续 → 中止
-      if (step.kind === 'expect' && !record.ok && !script.continueOnExpectFail) {
-        setAborted(i);
-        this.vc.pushMetric('__markers__', '__SCENARIO_ABORT__', performance.now());
-        this.markersMeta.push({ name: '__SCENARIO_ABORT__', ts: performance.now(), meta: { stepIndex: i } });
-        return;
+      if (step.kind === 'expect') {
+        const last = this.observations[this.observations.length - 1];
+        if (last && !last.passed && !script.continueOnExpectFail) {
+          setAborted('expect_fail');
+          sink.push('marker', '__SCENARIO_ABORT__', { detail: { stepIndex: i } });
+          return;
+        }
       }
     }
   }
 
-  private async executeOne(step: StepIR, script: CompiledScript, rec: ActionRecord): Promise<void> {
-    const readFn: ReadFn = (name) => this.reads[name];
+  private async executeOne(
+    step: StepIR, script: CompiledScript,
+    sink: EventSink, dispatcher: ActionDispatcher, state: Record<string, unknown>, intent?: string
+  ): Promise<void> {
+    const readFn: ReadFn = (name) => state[name];
 
     switch (step.kind) {
-      case 'wait': {
-        await sleep(step.ms);
-        return;
-      }
+      case 'wait': return void await sleep(step.ms);
       case 'wait_for': {
-        const start = performance.now();
-        while (performance.now() - start < step.timeoutMs) {
-          if (step.fn()) {
-            rec.result = true;
-            return;
-          }
+        const start = nowMs();
+        while (nowMs() - start < step.timeoutMs) {
+          if (step.fn()) { sink.push('observe', step.name, { ok: true, intent }); return; }
           await sleep(50);
         }
-        rec.ok = false;
-        rec.result = false;
+        sink.push('observe', step.name, { ok: false, intent });
         return;
       }
       case 'click': {
-        const ok = await this.actions.click(step.target, script.strategy, step.mode);
-        if (step.mark) this.pushMarker(step.mark, { kind: 'click' });
-        rec.ok = ok;
-        rec.meta = { target: step.target };
+        const ok = await dispatcher.click(step.target, script.strategy, step.mode);
+        if (step.mark) sink.push('marker', step.mark, { intent });
+        if (!ok) sink.push('error', `click:${this.stepName(step)}`, { intent });
         return;
       }
       case 'drag': {
-        const ok = await this.actions.drag(step.from, step.to, step.durationMs, script.strategy);
-        if (step.mark) this.pushMarker(step.mark, { kind: 'drag' });
-        rec.ok = ok;
-        rec.meta = { from: step.from, to: step.to };
+        const ok = await dispatcher.drag(step.from, step.to, step.durationMs, script.strategy);
+        if (step.mark) sink.push('marker', step.mark, { intent });
+        if (!ok) sink.push('error', 'drag', { intent });
         return;
       }
       case 'type': {
-        const ok = await this.actions.type(step.text, !!step.clearFirst, script.strategy);
-        if (step.mark) this.pushMarker(step.mark, { kind: 'type', length: step.text.length });
-        rec.ok = ok;
+        await dispatcher.type(step.text, !!step.clearFirst, script.strategy);
+        if (step.mark) sink.push('marker', step.mark, { intent });
         return;
       }
       case 'key': {
-        const ok = this.actions.key(step.key);
-        if (step.mark) this.pushMarker(step.mark, { kind: 'key', key: step.key });
-        rec.ok = ok;
-        rec.meta = { key: step.key };
+        dispatcher.key(step.key);
+        if (step.mark) sink.push('marker', step.mark, { intent });
         return;
       }
       case 'mark': {
-        this.pushMarker(step.name, step.meta);
+        sink.push('marker', step.name, { intent, detail: step.meta });
         return;
       }
       case 'observe': {
         const passed = !!step.fn();
-        rec.ok = true; // observe 不影响 flow
-        rec.result = passed;
-        this.observations.push({ name: step.name, ts: performance.now(), passed, required: false });
+        this.observations.push({ name: step.name, t: sink.relNow(), passed, required: false, intent });
+        sink.push('observe', step.name, { ok: passed, intent });
         return;
       }
       case 'read': {
         const v = step.fn();
-        this.reads[step.name] = v;
-        rec.result = v;
+        state[step.name] = v;
+        sink.push('read', step.name, { intent, detail: v });
         return;
       }
       case 'expect': {
         const passed = !!step.fn();
-        rec.ok = passed;
-        rec.result = passed;
-        this.observations.push({ name: step.name, ts: performance.now(), passed, required: true });
-        if (!passed) {
-          this.pushMarker(`__EXPECT_FAIL__:${step.name}`);
-        }
+        this.observations.push({ name: step.name, t: sink.relNow(), passed, required: true, intent });
+        sink.push('expect', step.name, { ok: passed, intent });
+        if (!passed) sink.push('marker', `__EXPECT_FAIL__:${step.name}`, { intent });
         return;
       }
       case 'branch': {
         const taken = step.predicate(readFn);
-        const branch = taken ? step.thenSteps : step.elseSteps;
-        rec.meta = { taken: taken ? 'then' : 'else', size: branch.length };
-        await this.executeSteps(
-          branch, script,
-          () => false, () => false, () => {}
-        );
+        await this.executeSteps(taken ? step.thenSteps : step.elseSteps, script,
+          sink, dispatcher, state, () => false, () => {});
         return;
       }
       case 'loop': {
         for (let n = 0; n < step.times; n++) {
-          await this.executeSteps(step.steps, script, () => false, () => false, () => {});
+          await this.executeSteps(step.steps, script, sink, dispatcher, state, () => false, () => {});
         }
-        rec.meta = { iterations: step.times };
         return;
       }
     }
@@ -331,68 +253,7 @@ export class SessionRunner {
       case 'loop': return `loop:${step.times}`;
     }
   }
-
-  private pushMarker(name: string, meta?: Record<string, any>): void {
-    const ts = performance.now();
-    this.vc.pushMetric('__markers__', name, ts);
-    this.markersMeta.push({ name, ts, meta });
-  }
-
-  private startTickLoop(): void {
-    this.lastFlushTs = performance.now();
-    const tick = () => {
-      if (!this.active) return;
-      this.tickOnce(false);
-      this.rafId = requestAnimationFrame(tick);
-    };
-    this.rafId = requestAnimationFrame(tick);
-  }
-
-  private tickOnce(force: boolean): void {
-    this.dom.sample();
-    if (this.enableAudio) this.audio.sample();
-    if (this.enableR3F) this.r3f.sample();
-
-    const now = performance.now();
-    if (force || now - this.lastFlushTs >= this.flushIntervalMs) {
-      this.flushFrame(now);
-      this.lastFlushTs = now;
-    }
-  }
-
-  private flushFrame(ts: number): void {
-    if (this.enableAudio) this.audio.flush();
-    const domSnap = this.dom.harvest();
-    const vData = this.vc.harvest();
-
-    const sources: TelemetryFrame['sources'] = [];
-    if (Object.keys(domSnap.nodes).length > 0) sources.push('dom');
-    if (Object.keys(vData).length > 0) sources.push('virtual');
-    // audio 和 r3f 已通过 vc 汇入 virtual
-
-    if (sources.length === 0) return;
-
-    this.frames.push({
-      ts: Math.floor(ts),
-      dur: this.flushIntervalMs,
-      sources,
-      domNodes: domSnap.nodes,
-      virtual: vData
-    });
-
-    // 防爆：超过 maxFrames 后做"丢中段保两端"，确保 LLMPayload 不会无界增长。
-    // 保留前半 60% + 后半 40% 是经验比例 —— 起始通常含 setup 信号，结尾含 victory/gameover 信号，
-    // 中段是稳态循环，丢一些不影响 LLM 推断。
-    if (this.frames.length > this.maxFrames) {
-      const head = Math.floor(this.maxFrames * 0.6);
-      const tail = this.maxFrames - head;
-      this.frames = [
-        ...this.frames.slice(0, head),
-        ...this.frames.slice(this.frames.length - tail)
-      ];
-      this.framesTruncated = true;
-    }
-  }
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+function nowMs(): number { return typeof performance !== 'undefined' ? performance.now() : Date.now(); }
